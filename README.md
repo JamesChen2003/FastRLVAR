@@ -14,6 +14,8 @@ FastVAR: Linear Visual Autoregressive Modeling via Cached Token Pruning (ICCV25)
 
 ![visitors](https://visitor-badge.laobi.icu/badge?page_id=cshguo.FastVAR)
 [![arXiv](https://img.shields.io/badge/arXiv-2503.23367-b31b1b.svg)](https://arxiv.org/pdf/2503.23367)
+[![Homepage](https://img.shields.io/badge/Project-Page-orange)](https://fastvar.github.io/)
+
 
 </div>
 
