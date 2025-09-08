@@ -115,7 +115,7 @@ Detailed results can be found in the paper.
 
 ## 🎈Core Algorithm
 
-For learning purpose, we provide the core algorithm of our FastVAR as follows (one may find the complete code in [this line]()). Since our FastVAR is a general technology, other VAR-based models also potentially apply.
+For learning purpose, we provide the core algorithm of our FastVAR as follows (one may find the complete code in [this line](https://github.com/csguoh/FastVAR/blob/34411a21c4f6f4b39bc55487944c21fff85806a4/Infinity/infinity/models/fastvar_utils.py#L12)). Since our FastVAR is a general technology, other VAR-based models also potentially apply.
 
 ```
 def masked_previous_scale_cache(cur_x, num_remain, cur_shape):
