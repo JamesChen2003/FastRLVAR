@@ -1,0 +1,139 @@
+# ============================================================
+# Python cache
+# ============================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+
+# ============================================================
+# Virtual environments
+# ============================================================
+venv/
+.env/
+.env*/
+.venv/
+
+# ============================================================
+# OS misc files
+# ============================================================
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Editor configs
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ============================================================
+# RL training logs (Infinity/)
+# ============================================================
+wandb/
+**/wandb/
+**/events.out.tfevents.*
+training_tmp_results/
+results/
+evaluation/
+
+# ============================================================
+# Checkpoints & model weights
+# ============================================================
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npz
+*.npy
+
+# Infinity pre-trained models
+Infinity/checkpoint/
+HART/**/checkpoint/
+**/checkpoints/
+**/models/
+
+# ============================================================
+# Massive evaluation datasets (MJHQ30K)
+# ============================================================
+Infinity/evaluation/MJHQ30K/
+Infinity/evaluation/gen_eval/prompts/evaluation_metadata.jsonl
+Infinity/evaluation/gen_eval/prompts/object_names.txt
+
+# ============================================================
+# Image datasets (HUGE)
+# Ignore all image files generically
+# ============================================================
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.webp
+
+# If you want to keep small demo assets, whitelist them:
+!assets/
+!assets/*.jpg
+!assets/*.png
+
+# ============================================================
+# Video outputs
+# ============================================================
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+
+# ============================================================
+# CUDA build artifacts (HART/kernels/)
+# ============================================================
+*.so
+*.o
+*.a
+*.cu.o
+build/
+dist/
+*.egg-info/
+
+# ============================================================
+# Logs and temporary files
+# ============================================================
+logs/
+log/
+*.log
+outputs/
+output/
+run/
+runs/
+*.tmp
+*.temp
+
+# ============================================================
+# Compressed files
+# ============================================================
+*.zip
+*.tar
+*.tar.gz
+*.7z
+
+# ============================================================
+# Notebook saved output
+# ============================================================
+*.ipynb
+
+# ============================================================
+# Project-specific ignores
+# ============================================================
+
+# HART autoencoder intermediate output
+HART/evaluation/gen_eval/_base_/datasets/
+HART/evaluation/gen_eval/mask2former/
+
+# FastVAR cache
+**/cache/
+**/__temp__/

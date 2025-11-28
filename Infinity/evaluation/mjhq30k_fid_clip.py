@@ -1,20 +1,28 @@
 import os
 import sys
-sys.path.insert(0,'/data2/guohang/Infinite')
 import random
 import torch
 import cv2
 import numpy as np
-from tools.run_infinity import *
 import gc
 import json
+import argparse
 from cleanfid import fid
 from clip_score import clip_score
 from tqdm import tqdm
 
-model_path='/data2/guohang/pretrained/Infinity/infinity_2b_reg.pth'
-vae_path='/data2/guohang/pretrained/Infinity/infinity_vae_d32reg.pth'
-text_encoder_ckpt = '/data2/guohang/pretrained/flan-t5-xl'
+# Ensure we can import from the project root (so that `tools.run_infinity` works
+# when this script is run from within the `evaluation` directory).
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from tools.run_infinity import *
+
+model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_2b_reg.pth'
+vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_vae_d32reg.pth'
+text_encoder_ckpt = 'google/flan-t5-xl'
+
 args=argparse.Namespace(
     pn='1M', # 1M, 0.60M, 0.25M, 0.06M
     model_path=model_path,
@@ -40,18 +48,22 @@ args=argparse.Namespace(
     save_file='tmp.jpg'
 )
 
+# Set device for Infinity pipeline (all models must be on same GPU)
+infinity_device = 'cuda:0'
+
 # load text encoder
-text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt)
+text_tokenizer, text_encoder = load_tokenizer(t5_path=args.text_encoder_ckpt, device=infinity_device)
 # load vae
-vae = load_visual_tokenizer(args)
+vae = load_visual_tokenizer(args, device=infinity_device)
 # load infinity
-infinity = load_transformer(vae, args)
+infinity = load_transformer(vae, args, device=infinity_device)
 
 # 16GB memo
 cfg = 4
 tau = 1.0
 h_div_w = 1/1 # aspect ratio, height:width
-seed = random.randint(0, 10000)
+# seed = random.randint(0, 10000)
+seed = 42
 enable_positive_prompt=0
 
 h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates-h_div_w))]
@@ -59,10 +71,10 @@ scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
 scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
 
 
-with open("/data2/guohang/dataset/MJHQ30K/meta_data.json") as f:
+with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/evaluation/MJHQ30K/meta_data.json") as f:
     meta_data = json.load(f)
 
-save_root_dir = "/data2/guohang/Infinite/mjhq_output/"
+save_root_dir = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/evaluation/MJHQ30K/output/"
 os.makedirs(save_root_dir,exist_ok=True)
 
 num_sampe = 0
@@ -93,10 +105,8 @@ for img_id,data in tqdm(meta_data.items()):
         cv2.imwrite(os.path.join(save_root_dir, category, f"{img_id}.png"), generated_image.cpu().numpy())
 
 
-
-
 # test fid
-ref_dir = "/data2/guohang/dataset/MJHQ30K/mjhq30k_imgs/people"
+ref_dir = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/evaluation/MJHQ30K/mjhq30k_imgs/people"
 gen_dir = save_root_dir
 fid_score = fid.compute_fid(ref_dir,gen_dir)
 print(f'FID score:{fid_score}')
@@ -107,15 +117,15 @@ import torch
 import clip
 from PIL import Image
 
-# Load the CLIP model
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model, preprocess = clip.load("ViT-L/14", device=device)
+# Load the CLIP model on GPU 1
+clip_device = "cuda:2" if torch.cuda.device_count() > 1 else "cuda:0"
+model, preprocess = clip.load("ViT-L/14", device=clip_device)
 def compute_clip_score(image_path, text):
     # Load and preprocess the image
-    image = preprocess(Image.open(image_path)).unsqueeze(0).to(device)
+    image = preprocess(Image.open(image_path)).unsqueeze(0).to(clip_device)
 
     # Tokenize the text
-    text = clip.tokenize([text],truncate=True).to(device)
+    text = clip.tokenize([text],truncate=True).to(clip_device)
 
     # Compute the feature vectors
     with torch.no_grad():

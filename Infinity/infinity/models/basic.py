@@ -15,10 +15,14 @@ from timm.models.layers import DropPath, drop_path
 from torch.utils.checkpoint import checkpoint
 
 # Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
-from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+try:
+    from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+    from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+except:
+    flash_attn_func, flash_attn_varlen_kvpacked_func = None, None
 
 from torch.nn.functional import scaled_dot_product_attention as slow_attn    # q, k, v: BHLc
+from torch.nn.utils.rnn import pad_sequence
 
 
 # def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
@@ -419,13 +423,50 @@ class CrossAttention(nn.Module):
         q_compact = q_compact.contiguous()
         kv_compact = kv_compact.contiguous()
         
-        cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
-        if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-            oup = oup.float()
+        if flash_attn_varlen_kvpacked_func is not None:
+            cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
+            if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
+                oup = flash_attn_varlen_kvpacked_func(
+                    q=q_compact.to(dtype=torch.bfloat16),
+                    kv=kv_compact.to(dtype=torch.bfloat16),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=Lq,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=0,
+                    softmax_scale=self.scale,
+                ).reshape(B, Lq, -1)
+                oup = oup.float()
+            else:
+                oup = flash_attn_varlen_kvpacked_func(
+                    q=q_compact,
+                    kv=kv_compact,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=Lq,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=0,
+                    softmax_scale=self.scale,
+                ).reshape(B, Lq, -1)
         else:
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-        
+            lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).tolist()
+            kv_chunks = kv_compact.split(lengths, dim=0)
+            k_padded = pad_sequence([chunk[:, 0] for chunk in kv_chunks], batch_first=True)
+            v_padded = pad_sequence([chunk[:, 1] for chunk in kv_chunks], batch_first=True)
+
+            q_heads = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+            k_heads = k_padded.transpose(1, 2)
+            v_heads = v_padded.transpose(1, 2)
+
+            max_len = k_heads.shape[2]
+            lengths_tensor = torch.tensor(lengths, device=k_heads.device, dtype=torch.long)
+            key_mask = torch.arange(max_len, device=k_heads.device, dtype=torch.long).expand(B, max_len) >= lengths_tensor.unsqueeze(1)
+            attn_mask = torch.zeros(B, 1, 1, max_len, device=q_heads.device, dtype=torch.float32)
+            attn_mask.masked_fill_(key_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+            attn_out = slow_attn(q_heads, k_heads, v_heads, attn_mask=attn_mask, dropout_p=0.0, scale=self.scale)
+            oup = attn_out.transpose(1, 2).reshape(B, Lq, -1)
+ 
         return self.proj_drop(self.proj(oup))
     
     def extra_repr(self) -> str:

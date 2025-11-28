@@ -22,13 +22,11 @@ from torch.cuda.amp import autocast
 
 from infinity.models.infinity import Infinity
 from infinity.models.basic import *
+from infinity.models.fastvar_utils import reset_prune_print_cache
 import PIL.Image as PImage
 from torchvision.transforms.functional import to_tensor
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w, h_div_w_templates
 import torchvision.utils as vutils
-
-
-
 
 
 def extract_key_val(text):
@@ -69,12 +67,35 @@ def aug_with_positive_prompt(prompt):
     return prompt
 
 
+
+image_num = 0
+def get_pruning_ratio(scale: int, num_scales: int) -> float:
+    """
+    Example pruning schedule:
+    - No pruning on earlier scales
+    - Stronger pruning on the last few scales
+    This function is just a placeholder; in your project you can replace it
+    with an RL agent or any other controller.
+    """
+    prune_scale_list = [0.0] * num_scales
+    global image_num
+    # Apply pruning only to the last few scales.
+    N = min(5, num_scales)
+    tail_pattern = [
+        [0.4, 0.5, 1.0, 0.8, 1.0][:N],
+        [0.8, 0.7, 0.6, 1.0, 1.0][:N]
+        ]
+    prune_scale_list[-N:] = tail_pattern[image_num % 2]
+    if scale == num_scales - 1:
+        image_num += 1
+    return prune_scale_list[scale]
+
 def gen_one_img(
-    infinity_test, 
-    vae, 
+    infinity_test,
+    vae,
     text_tokenizer,
     text_encoder,
-    prompt, 
+    prompt,
     cfg_list=[],
     tau_list=[],
     negative_prompt='',
@@ -92,6 +113,9 @@ def gen_one_img(
     g_seed=None,
     sampling_per_bits=1,
     enable_positive_prompt=0,
+    save_intermediate_results=False,
+    save_dir=None,
+    per_scale_infer=False,
 ):
     sstt = time.time()
     if not isinstance(cfg_list, list):
@@ -103,24 +127,105 @@ def gen_one_img(
         negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
     else:
         negative_label_B_or_BLT = None
-    print(f'cfg: {cfg_list}, tau: {tau_list}')
+    # print(f'cfg: {cfg_list}, tau: {tau_list}')
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
-        _, intermidiate_list, img_list = infinity_test.autoregressive_infer_cfg(
-            vae=vae,
-            scale_schedule=scale_schedule,
-            label_B_or_BLT=text_cond_tuple, g_seed=g_seed,
-            B=1, negative_label_B_or_BLT=negative_label_B_or_BLT, force_gt_Bhw=None,
-            cfg_sc=cfg_sc, cfg_list=cfg_list, tau_list=tau_list, top_k=top_k, top_p=top_p,
-            returns_vemb=1, ratio_Bl1=None, gumbel=gumbel, norm_cfg=False,
-            cfg_exp_k=cfg_exp_k, cfg_insertion_layer=cfg_insertion_layer,
-            vae_type=vae_type, softmax_merge_topk=softmax_merge_topk,
-            ret_img=True, trunk_scale=1000,
-            gt_leak=gt_leak, gt_ls_Bl=gt_ls_Bl, inference_mode=True,
-            sampling_per_bits=sampling_per_bits,
-        )
+        if per_scale_infer:
+            # Use step-wise generation via `infer_pruned_per_scale`, iterating all scales.
+            # This matches `autoregressive_infer_cfg` behavior (VAE / bit-label path)
+            # while allowing dynamic per-scale pruning.
 
+            if vae_type == 0 or not getattr(infinity_test, "use_bit_label", True):
+                raise NotImplementedError(
+                    "per_scale_infer=True is currently supported only for vae_type != 0 "
+                    "and use_bit_label == True."
+                )
 
+            # Ensure cfg_insertion_layer is a list, as expected by the model.
+            if not isinstance(cfg_insertion_layer, (list, tuple)):
+                cfg_insertion_layer_ = [cfg_insertion_layer]
+            else:
+                cfg_insertion_layer_ = list(cfg_insertion_layer)
+
+            state = None
+            summed_codes = None
+            img = None
+
+            num_scales = len(scale_schedule)
+
+            for si in range(num_scales):
+                prune_ratio = get_pruning_ratio(si, num_scales)
+
+                codes, summed_codes, img, state = infinity_test.infer_pruned_per_scale(
+                    vae=vae,
+                    scale_schedule=scale_schedule,
+                    label_B_or_BLT=text_cond_tuple,
+                    scale_ind=si,
+                    prune_ratio=prune_ratio,
+                    B=1,
+                    negative_label_B_or_BLT=negative_label_B_or_BLT,
+                    g_seed=g_seed if si == 0 else None,
+                    cfg_list=cfg_list,
+                    tau_list=tau_list,
+                    cfg_sc=cfg_sc,
+                    top_k=top_k,
+                    top_p=top_p,
+                    returns_vemb=1,
+                    cfg_insertion_layer=cfg_insertion_layer_,
+                    vae_type=vae_type,
+                    trunk_scale=1000,
+                    gt_leak=gt_leak if gt_leak >= 0 else 0,
+                    gt_ls_Bl=gt_ls_Bl,
+                    inference_mode=True,
+                    sampling_per_bits=sampling_per_bits,
+                    save_intermediate_results=save_intermediate_results,
+                    save_dir=save_dir,
+                    state=state,
+                )
+
+            # One full image (all scales) is done; reset print cache so pruning
+            # ratio logs are emitted again for the next image.
+            reset_prune_print_cache()
+
+            # `img` is already the decoded uint8 image for the final scale.
+            img_list = [img]
+
+        else:
+            _, intermidiate_list, img_list = infinity_test.autoregressive_infer_cfg(
+                vae=vae,
+                scale_schedule=scale_schedule,
+                label_B_or_BLT=text_cond_tuple,
+                g_seed=g_seed,
+                B=1,
+                negative_label_B_or_BLT=negative_label_B_or_BLT,
+                force_gt_Bhw=None,
+                cfg_sc=cfg_sc,
+                cfg_list=cfg_list,
+                tau_list=tau_list,
+                top_k=top_k,
+                top_p=top_p,
+                returns_vemb=1,
+                ratio_Bl1=None,
+                gumbel=gumbel,
+                norm_cfg=False,
+                cfg_exp_k=cfg_exp_k,
+                cfg_insertion_layer=cfg_insertion_layer,
+                vae_type=vae_type,
+                softmax_merge_topk=softmax_merge_topk,
+                ret_img=True,
+                trunk_scale=1000,
+                gt_leak=gt_leak,
+                gt_ls_Bl=gt_ls_Bl,
+                inference_mode=True,
+                sampling_per_bits=sampling_per_bits,
+                save_intermediate_results=save_intermediate_results,
+                save_dir=save_dir,
+            )
+
+    # img_list elements are batched tensors [B, H, W, C]; for our single-image
+    # inference we return the first item in the batch.
     img = img_list[0]
+    if isinstance(img, torch.Tensor) and img.dim() == 4 and img.shape[0] == 1:
+        img = img[0]
 
     return img
 
@@ -142,12 +247,13 @@ def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_
     print('[Save slim model] done')
     return save_file
 
-def load_tokenizer(t5_path =''):
+def load_tokenizer(t5_path ='', device='cuda'):
     print(f'[Loading tokenizer and text encoder]')
     text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(t5_path, revision=None, legacy=True)
     text_tokenizer.model_max_length = 512
     text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(t5_path, torch_dtype=torch.float16)
-    text_encoder.to('cuda')
+    
+    text_encoder.to(device)
     text_encoder.eval()
     text_encoder.requires_grad_(False)
     return text_tokenizer, text_encoder
@@ -172,6 +278,9 @@ def load_infinity(
     print(f'[Loading Infinity]')
     text_maxlen = 512
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
+        model_kwargs = model_kwargs or {}
+        default_prune_cfg = model_kwargs.pop("prune_scale_list", None)
+
         infinity_test: Infinity = Infinity(
             vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
             shared_aln=True, raw_scale_schedule=scale_schedule,
@@ -188,6 +297,7 @@ def load_infinity(
             apply_spatial_patchify=apply_spatial_patchify,
             inference_mode=True,
             train_h_div_w_list=[1.0],
+            prune_scale_list=default_prune_cfg,
             **model_kwargs,
         ).to(device=device)
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
@@ -245,8 +355,8 @@ def joint_vi_vae_encode_decode(vae, image_path, scale_schedule, device, tgt_h, t
     print(recons_img.shape, gt_img.shape)
     return gt_img, recons_img, all_bit_indices
 
-def load_visual_tokenizer(args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def load_visual_tokenizer(args, device='cuda'):
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # load vae
     if args.vae_type in [16,18,20,24,32,64]:
         from infinity.models.bsq_vae.vae import vae_model
@@ -267,8 +377,8 @@ def load_visual_tokenizer(args):
         raise ValueError(f'vae_type={args.vae_type} not supported')
     return vae
 
-def load_transformer(vae, args):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def load_transformer(vae, args, device='cuda'):
+    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model_path = args.model_path
     if args.checkpoint_type == 'torch': 
         # assert ('ar-' in model_path) or ('slim-' in model_path)
@@ -294,6 +404,9 @@ def load_transformer(vae, args):
         kwargs_model = dict(depth=40, embed_dim=2688, num_heads=24, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
     elif args.model_type == 'infinity_layer48':
         kwargs_model = dict(depth=48, embed_dim=3360, num_heads=28, drop_path_rate=0.1, mlp_ratio=4, block_chunks=4)
+    prune_cfg = getattr(args, 'prune_scale_list', None)
+    if prune_cfg:
+        kwargs_model["prune_scale_list"] = prune_cfg
     infinity = load_infinity(
         rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
         rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,
@@ -338,6 +451,12 @@ def add_common_arguments(parser):
     parser.add_argument('--checkpoint_type', type=str, default='torch')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--bf16', type=int, default=1, choices=[0,1])
+    parser.add_argument(
+        '--prune_scales',
+        type=str,
+        default='',
+        help='Comma-separated list of scale:ratio entries (e.g. "32:0.4,40:0.5").'
+    )
 
 
 if __name__ == '__main__':
@@ -346,6 +465,21 @@ if __name__ == '__main__':
     parser.add_argument('--prompt', type=str, default='a dog')
     parser.add_argument('--save_file', type=str, default='./tmp.jpg')
     args = parser.parse_args()
+
+    if args.prune_scales:
+        prune_scale_list = {}
+        for entry in args.prune_scales.split(','):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                scale_str, ratio_str = entry.split(':')
+                prune_scale_list[int(scale_str)] = float(ratio_str)
+            except ValueError as exc:
+                raise ValueError(f"Invalid prune_scales entry '{entry}'. Expected format scale:ratio") from exc
+        args.prune_scale_list = prune_scale_list
+    else:
+        args.prune_scale_list = None
 
     # parse cfg
     args.cfg = list(map(float, args.cfg.split(',')))

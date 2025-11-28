@@ -15,8 +15,11 @@ from timm.models.layers import DropPath, drop_path
 from torch.utils.checkpoint import checkpoint
 
 # Import flash_attn's attention
-from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
-from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+try:
+    from flash_attn import flash_attn_func                  # q, k, or v: BLHc, ret: BLHc
+    from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
+except:
+    flash_attn_func, flash_attn_varlen_kvpacked_func = None, None
 
 # Uncomment this function if you want to benchmark sppedup with vanilla attn.
 # def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
@@ -30,6 +33,9 @@ from flash_attn import flash_attn_varlen_kvpacked_func  # qkv: N3Hc, ret: NHc
 #     ) @ value
 
 
+from torch.nn.functional import scaled_dot_product_attention as slow_attn
+from torch.nn.utils.rnn import pad_sequence
+
 from infinity.models.fastvar_utils import compute_merge
 
 # Import flash_attn's fused ops
@@ -41,7 +47,6 @@ try:
     flash_fused_op_installed = True
 except ImportError:
     dropout_add_layer_norm = dropout_add_rms_norm = fused_mlp_func = None
-    flash_fused_op_installed = False
     
     def rms_norm_impl(x, weight, epsilon):
         return (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True).add_(epsilon))) * weight
@@ -266,11 +271,13 @@ class FastVARSelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                # flashattn
-                q, k, v = q.transpose(1,2), k.transpose(1,2),v.transpose(1,2)
-                oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
-                # slow attn
-                #oup = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_bias_or_two_vector, dropout_p=0).transpose(1, 2).reshape(B, L, C) #b head l d
+                q_heads, k_heads, v_heads = q, k, v
+                if flash_attn_func is not None:
+                    oup = flash_attn_func(q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
+                else:
+                    attn_mask = attn_bias_or_two_vector
+                    attn_out = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
+                    oup = attn_out.transpose(1, 2).reshape(B, L, C)
 
             # oup: bf16
         
@@ -357,13 +364,50 @@ class CrossAttention(nn.Module):
         q_compact = q_compact.contiguous()
         kv_compact = kv_compact.contiguous()
         
-        cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
-        if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact.to(dtype=torch.bfloat16), kv=kv_compact.to(dtype=torch.bfloat16), cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-            oup = oup.float()
+        if flash_attn_varlen_kvpacked_func is not None:
+            cu_seqlens_q = torch.arange(0, Lq * (B+1), Lq, dtype=torch.int32, device=q_compact.device)
+            if q_compact.dtype == torch.float32:    # todo: fp16 or bf16?
+                oup = flash_attn_varlen_kvpacked_func(
+                    q=q_compact.to(dtype=torch.bfloat16),
+                    kv=kv_compact.to(dtype=torch.bfloat16),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=Lq,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=0,
+                    softmax_scale=self.scale,
+                ).reshape(B, Lq, -1)
+                oup = oup.float()
+            else:
+                oup = flash_attn_varlen_kvpacked_func(
+                    q=q_compact,
+                    kv=kv_compact,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    max_seqlen_q=Lq,
+                    max_seqlen_k=max_seqlen_k,
+                    dropout_p=0,
+                    softmax_scale=self.scale,
+                ).reshape(B, Lq, -1)
         else:
-            oup = flash_attn_varlen_kvpacked_func(q=q_compact, kv=kv_compact, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=Lq, max_seqlen_k=max_seqlen_k, dropout_p=0, softmax_scale=self.scale).reshape(B, Lq, -1)
-        
+            lengths = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).tolist()
+            kv_chunks = kv_compact.split(lengths, dim=0)
+            k_padded = pad_sequence([chunk[:, 0] for chunk in kv_chunks], batch_first=True)
+            v_padded = pad_sequence([chunk[:, 1] for chunk in kv_chunks], batch_first=True)
+
+            q_heads = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
+            k_heads = k_padded.transpose(1, 2)
+            v_heads = v_padded.transpose(1, 2)
+
+            max_len = k_heads.shape[2]
+            lengths_tensor = torch.tensor(lengths, device=k_heads.device, dtype=torch.long)
+            key_mask = torch.arange(max_len, device=k_heads.device, dtype=torch.long).expand(B, max_len) >= lengths_tensor.unsqueeze(1)
+            attn_mask = torch.zeros(B, 1, 1, max_len, device=q_heads.device, dtype=torch.float32)
+            attn_mask.masked_fill_(key_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+
+            attn_out = slow_attn(q_heads, k_heads, v_heads, attn_mask=attn_mask, dropout_p=0.0, scale=self.scale)
+            oup = attn_out.transpose(1, 2).reshape(B, Lq, -1)
+ 
         return self.proj_drop(self.proj(oup))
     
     def extra_repr(self) -> str:
@@ -378,6 +422,7 @@ class FastVARCrossAttnBlock(nn.Module):
         num_heads, mlp_ratio=4., drop=0., drop_path=0., tau=1, cos_attn=False,
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
+        prune_scale_list=None,
     ):
         super(FastVARCrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -414,12 +459,14 @@ class FastVARCrossAttnBlock(nn.Module):
         self.previous_scale_cache_cross_attn = None
         self.previous_scale_cache_ffn = None
         self.cached_size = [24, 24] # we cahce the scale at 24 as cached feature for subsequant feature restoration
+        # self.cached_size = [8, 8] # we cahce the scale at 24 as cached feature for subsequant feature restoration
+        self.prune_scale_list = prune_scale_list
     
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, layer_idx=-1, x_shape=None):
         gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
         is_later_layer = True if layer_idx in list(range(3,28)) else False
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer,x_shape=x_shape)
         shortcut = x
         x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale1, shift=shift1)
         x_sa = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind,rope_idx=idx_fn,ori_len=shortcut.shape[1]).mul_(gamma1)
@@ -429,13 +476,13 @@ class FastVARCrossAttnBlock(nn.Module):
             self.previous_scale_cache_self_attn = x_sa
         x = shortcut + self.drop_path(x_sa)
 
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer,x_shape=x_shape)
         x_ca = unmerge_fn(self.ca(self.ca_norm(merge_fn(x)), ca_kv).float().mul_(self.ca_gamma),self.previous_scale_cache_cross_attn, self.cached_size)
         if x.shape[1] in [self.cached_size[0]*self.cached_size[1]]:
             self.previous_scale_cache_cross_attn = x_ca
         x = x + x_ca
 
-        merge_fn, unmerge_fn, idx_fn = compute_merge(x, is_later_layer=is_later_layer,x_shape=x_shape)
+        merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer,x_shape=x_shape)
         x_ffn = unmerge_fn(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale2, shift=shift2)).mul(gamma2),self.previous_scale_cache_ffn,self.cached_size)
         if x.shape[1] in [self.cached_size[0] * self.cached_size[1]]:
             self.previous_scale_cache_ffn = x_ffn
