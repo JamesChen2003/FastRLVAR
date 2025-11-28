@@ -1,47 +1,71 @@
-# ============================================================
-# Python cache
-# ============================================================
+############################################################
+# Python cache / bytecode
+############################################################
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
-.ipynb_checkpoints/
+*.pkl
 
-# ============================================================
+############################################################
 # Virtual environments
-# ============================================================
-venv/
-.env/
-.env*/
+############################################################
 .venv/
+venv/
+env/
+.env/
+.envrc
 
-# ============================================================
-# OS misc files
-# ============================================================
+############################################################
+# OS / editor cruft
+############################################################
 .DS_Store
 Thumbs.db
-
-# ============================================================
-# Editor configs
-# ============================================================
-.vscode/
-.idea/
 *.swp
 *.swo
+*.tmp
+*.bak
 
-# ============================================================
-# RL training logs (Infinity/)
-# ============================================================
-wandb/
-**/wandb/
-**/events.out.tfevents.*
+.vscode/
+.idea/
+
+############################################################
+# Logs, runs, temporary results
+############################################################
+logs/
+log/
+*/logs/
+*.log
+
+runs/
+run/
 training_tmp_results/
-results/
-evaluation/
+Infinity/training_tmp_results/
 
-# ============================================================
-# Checkpoints & model weights
-# ============================================================
+results/
+Infinity/results/
+
+############################################################
+# wandb / TensorBoard (all experiment artifacts)
+############################################################
+wandb/
+Infinity/wandb/
+**/wandb/
+events.out.tfevents.*
+
+############################################################
+# RL run directories (checkpoint dumps, not source)
+############################################################
+Infinity/A2C1/
+Infinity/PPO1/
+Infinity/PPO2/
+Infinity/PPO3/
+Infinity/PPO4/
+Infinity/PPO5/
+
+############################################################
+# Model weights / checkpoints / large tensors
+############################################################
 *.pt
 *.pth
 *.ckpt
@@ -50,23 +74,24 @@ evaluation/
 *.npz
 *.npy
 
-# Infinity pre-trained models
-Infinity/checkpoint/
-HART/**/checkpoint/
+# Infinity checkpoints (keep script, ignore weights)
+Infinity/checkpoint/*.pth
+
+# Generic model directories that usually only contain weights
 **/checkpoints/
-**/models/
+**/models/**/pytorch_model.bin
 
-# ============================================================
-# Massive evaluation datasets (MJHQ30K)
-# ============================================================
+############################################################
+# Huge evaluation datasets (MJHQ30K etc.)
+############################################################
 Infinity/evaluation/MJHQ30K/
-Infinity/evaluation/gen_eval/prompts/evaluation_metadata.jsonl
-Infinity/evaluation/gen_eval/prompts/object_names.txt
+Infinity/evaluation/MJHQ30K/mjhq30k_imgs/
+Infinity/evaluation/MJHQ30K/output/
 
-# ============================================================
-# Image datasets (HUGE)
-# Ignore all image files generically
-# ============================================================
+############################################################
+# Image / video data (keep small assets/, ignore everything else)
+############################################################
+# Big data images
 *.jpg
 *.jpeg
 *.png
@@ -75,65 +100,46 @@ Infinity/evaluation/gen_eval/prompts/object_names.txt
 *.tiff
 *.webp
 
-# If you want to keep small demo assets, whitelist them:
+# Keep repo illustration assets
 !assets/
 !assets/*.jpg
+!assets/*.jpeg
 !assets/*.png
+!assets/*.gif
 
-# ============================================================
 # Video outputs
-# ============================================================
 *.mp4
 *.avi
 *.mov
 *.mkv
 *.webm
 
-# ============================================================
-# CUDA build artifacts (HART/kernels/)
-# ============================================================
-*.so
-*.o
-*.a
-*.cu.o
+############################################################
+# Build artifacts (C/C++/CUDA, Python packaging)
+############################################################
 build/
 dist/
 *.egg-info/
+.eggs/
+*.so
+*.a
+*.o
+*.obj
 
-# ============================================================
-# Logs and temporary files
-# ============================================================
-logs/
-log/
-*.log
-outputs/
-output/
-run/
-runs/
-*.tmp
-*.temp
+# HART CUDA extension build dir
+HART/hart/kernels/build/
 
-# ============================================================
-# Compressed files
-# ============================================================
+############################################################
+# Compression / archives
+############################################################
 *.zip
 *.tar
 *.tar.gz
+*.tgz
 *.7z
+*.rar
 
-# ============================================================
-# Notebook saved output
-# ============================================================
-*.ipynb
-
-# ============================================================
-# Project-specific ignores
-# ============================================================
-
-# HART autoencoder intermediate output
-HART/evaluation/gen_eval/_base_/datasets/
-HART/evaluation/gen_eval/mask2former/
-
-# FastVAR cache
-**/cache/
-**/__temp__/
+############################################################
+# Local helper files
+############################################################
+tree.txt
