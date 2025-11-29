@@ -1,11 +1,16 @@
-import sys
-sys.path.insert(0, 'viescore')
-
-from utils import (
-    mllm_output_to_dict
-)
 import math
-import vie_prompts
+import os
+import sys
+
+# Ensure this package directory is on sys.path so that
+# top-level imports like `import mllm_tools` work regardless
+# of current working directory.
+_PKG_DIR = os.path.dirname(__file__)
+if _PKG_DIR not in sys.path:
+    sys.path.insert(0, _PKG_DIR)
+
+from .utils import mllm_output_to_dict
+from . import vie_prompts
 
 class VIEScore:
     def __init__(self, backbone="gpt4o", task="t2i", key_path=None) -> None:
@@ -75,6 +80,20 @@ class VIEScore:
             guess_if_cannot_parse = True if tries > max_tries else False
             result_SC = self.model.get_parsed_output(SC_prompt_final)
             result_PQ = self.model.get_parsed_output(PQ_prompt_final)
+
+            # Debug logging: inspect raw MLLM outputs for formatting issues.
+            def _preview(name, content, max_len: int = 800):
+                try:
+                    s = str(content)
+                except Exception:
+                    s = repr(content)
+                if len(s) > max_len:
+                    s = s[:max_len] + "...[truncated]"
+                print(f"[VIEScore debug] Raw {name} output (len={len(s)}):")
+                print(s)
+
+            _preview("SC", result_SC)
+            _preview("PQ", result_PQ)
             SC_dict = mllm_output_to_dict(result_SC, give_up_parsing=guess_if_cannot_parse)
             PQ_dict = mllm_output_to_dict(result_PQ, give_up_parsing=guess_if_cannot_parse)
 
@@ -109,4 +128,3 @@ if __name__ == "__main__":
         prompt = dataset['prompt'][idx]
         print(model.evaluate(left_image, prompt, extract_all_score=True))
         print(model.evaluate(right_image, prompt, extract_all_score=True))
-

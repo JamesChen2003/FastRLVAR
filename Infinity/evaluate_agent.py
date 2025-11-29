@@ -27,12 +27,9 @@ try:
     import clip
 except ImportError:
     clip = None
+sys.path.append("/nfs/home/tensore/RL/FastRLVAR/VIEScore")
 
-try:
-    import viescore
-except ImportError:
-    viescore = None
-
+import viescore
 # ==========================================
 # CONFIGURATION: 設定要測的項目
 # ==========================================
@@ -59,51 +56,22 @@ DEFAULT_VIESCORE_MODEL = "TIGER-Lab/VIEScore"
 
 def load_viescore_model(model_name: str, device: str):
     """
-    嘗試用常見 API 載入 VIEScore；若都失敗則回傳 None。
+    使用本地 VIEScore repo 的 VIEScore 類別，不走 HuggingFace。
+    model_name 目前會被忽略，只是為了相容舊參數。
     """
-    if viescore is None:
-        print("Warning: viescore not installed, VIEScore metric will be 0. Install per https://github.com/TIGER-AI-Lab/VIEScore")
+    cls = getattr(viescore, "VIEScore", None)
+    if cls is None:
+        print("Warning: viescore.VIEScore not found, VIEScore metric will be 0.")
         return None
 
-    tried = []
-
-    # Pattern 1: class VIEScore.from_pretrained(...)
-    cls = getattr(viescore, "VIEScore", None)
-    if cls is not None and hasattr(cls, "from_pretrained"):
-        try:
-            print(f"Loading VIEScore via VIEScore.from_pretrained({model_name})...")
-            model = cls.from_pretrained(model_name, device=device)
-            print("VIEScore model loaded.")
-            return model
-        except Exception as e:
-            tried.append(f"VIEScore.from_pretrained: {e}")
-
-    # Pattern 2: module-level load_viescore(model_name, device=...)
-    fn = getattr(viescore, "load_viescore", None)
-    if fn is not None:
-        try:
-            print(f"Loading VIEScore via load_viescore({model_name})...")
-            model = fn(model_name, device=device)
-            print("VIEScore model loaded.")
-            return model
-        except Exception as e:
-            tried.append(f"load_viescore: {e}")
-
-    # Pattern 3: module-level load(model_name)
-    fn = getattr(viescore, "load", None)
-    if fn is not None:
-        try:
-            print(f"Loading VIEScore via load({model_name})...")
-            model = fn(model_name)
-            if hasattr(model, "to"):
-                model = model.to(device)
-            print("VIEScore model loaded.")
-            return model
-        except Exception as e:
-            tried.append(f"load: {e}")
-
-    print("Warning: failed to load VIEScore model; attempts:", tried)
-    return None
+    try:
+        print("Initializing local VIEScore(backbone='gemini', task='t2i') from viescore.VIEScore ...")
+        model = cls(backbone="gemini", task="t2i")
+        print("VIEScore model initialized.")
+        return model
+    except Exception as e:
+        print(f"Warning: failed to initialize local VIEScore: {e}")
+        return None
 
 
 class MetricsEvaluator:
@@ -213,18 +181,30 @@ class MetricsEvaluator:
         return score
 
     def calc_viescore(self, img_pil, prompt_text):
-        if self.viescore_model is None: return 0.0
-        if prompt_text is None: return 0.0
-        # 依據 VIEScore 官方接口，假設有 score(prompt, image)
-        if hasattr(self.viescore_model, "score"):
+        if self.viescore_model is None: 
+            return 0.0
+        if prompt_text is None:
+            return 0.0
+        # 使用官方 VIEScore 介面：evaluate(image, text, ...)
+        try:
             with torch.no_grad():
-                return self.viescore_model.score(prompt_text, img_pil)
-        # 若模型本身是可調用 (callable)
-        if callable(self.viescore_model):
-            with torch.no_grad():
-                return self.viescore_model(prompt_text, img_pil)
-        print("Warning: VIEScore model does not expose score(prompt, image); returning 0.")
-        return 0.0
+                score = self.viescore_model.evaluate(
+                    img_pil,
+                    prompt_text,
+                    extract_overall_score_only=True,
+                    extract_all_score=False,
+                    echo_output=False,
+                )
+        except Exception as e:
+            print(f"Warning: VIEScore.evaluate failed: {e}; returning 0.")
+            return 0.0
+        # evaluate 可能回傳單一分數或 list
+        if isinstance(score, (list, tuple)) and len(score) > 0:
+            return float(score[-1])
+        try:
+            return float(score)
+        except Exception:
+            return 0.0
 
     def calc_geneval(self, img_pil, prompt_text):
         # TODO: GenEval usually requires running object detection 

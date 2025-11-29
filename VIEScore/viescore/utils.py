@@ -209,6 +209,10 @@ def mllm_output_to_dict(input_string, give_up_parsing=False):
                 end_index = len(json_str)
             else:
                 print("Failed to find the json content in the string.")
+                # Debug: print a truncated view of the raw model output for analysis
+                raw_preview = input_string if len(input_string) < 800 else input_string[:800] + "...[truncated]"
+                print("[VIEScore debug] Raw model output:")
+                print(raw_preview)
                 return False
     
     # Check if we found two delimiters
@@ -228,6 +232,9 @@ def mllm_output_to_dict(input_string, give_up_parsing=False):
                 return new_data
             except:
                 print("Error: Cannot fix", json_str)
+                raw_preview = input_string if len(input_string) < 800 else input_string[:800] + "...[truncated]"
+                print("[VIEScore debug] Raw model output when fixing failed:")
+                print(raw_preview)
                 return False
         return new_data
     else:
