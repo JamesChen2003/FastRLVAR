@@ -271,12 +271,14 @@ class FastVARSelfAttention(nn.Module):
             if self.use_flex_attn and attn_fn is not None:
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
-                q_heads, k_heads, v_heads = q, k, v
+                # flash_attn_func expects inputs shaped as (B, L, H, c); our tensors are (B, H, L, c) here
+                # so transpose to keep head counts aligned between q/k/v before invoking the kernel
+                q_heads, k_heads, v_heads = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
                 if flash_attn_func is not None:
                     oup = flash_attn_func(q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
                 else:
                     attn_mask = attn_bias_or_two_vector
-                    attn_out = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
+                    attn_out = slow_attn(query=q, key=k, value=v, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
                     oup = attn_out.transpose(1, 2).reshape(B, L, C)
 
             # oup: bf16
@@ -512,4 +514,3 @@ class AdaLNBeforeHead(nn.Module):
             return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
         else:
             return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
-

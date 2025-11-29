@@ -9,9 +9,9 @@ from contextlib import contextmanager
 import gc
 import argparse
 
-model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_2b_reg.pth'
-vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_vae_d32reg.pth'
-text_encoder_ckpt = 'google/flan-t5-xl'
+model_path='/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
+vae_path=  '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
+text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
 # ------------ multi-prompt definition (name -> text) -------------
 # prompts = {
@@ -21,7 +21,7 @@ text_encoder_ckpt = 'google/flan-t5-xl'
 #     # "woman":     "An anime-style portrait of a woman.",
 #     # "man":       "A detailed photo-realistic image of a man."
 # }
-with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/evaluation/MJHQ30K/meta_data.json") as f:
+with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json") as f:
     meta_data = json.load(f)
 
 prompts = {}
