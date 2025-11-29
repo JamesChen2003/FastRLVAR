@@ -234,3 +234,24 @@ Outputs:
 - Optional intermediates/DFT results as described above.
 
 
+---
+
+## 6. 評估指標 (`evaluate_agent.py`)
+
+`evaluate_agent.py` 用來比較三組影像結果：Original / FAST / RL，並計算多種影像與文字相關指標。
+
+- 支援指標：
+  - Similarity：PSNR、SSIM、LPIPS（需要 `--orig` 對照圖）。
+  - Text-Image Quality：CLIP Score（必須有 prompt）。
+  - 可選：ImageReward、VIEScore（需額外安裝與 API key，預設關閉或實驗性使用）。
+- Prompt 來源：
+  - 優先從輸入資料夾中的 `meta_data.json` 或 `metadata.json` 取得（格式為 `{image_id: {"prompt": "...", ...}}`）。
+  - 若找不到，才退回用檔名推測 prompt（`xxx_yyy.jpg -> "xxx yyy"`）。
+
+基本使用方式（從 `Infinity/` 底下執行）：
+
+```bash
+python evaluate_agent.py \
+  --orig path/to/orig_images \
+  --fast path/to/fast_images \
+  --rl   path/to/rl_images
