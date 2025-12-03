@@ -8,8 +8,8 @@ from types import MethodType
 
 from gymnasium.envs.registration import register
 
-import wandb
-from wandb.integration.sb3 import WandbCallback
+# import wandb
+# from wandb.integration.sb3 import WandbCallback
 from stable_baselines3.common.callbacks import BaseCallback
 
 from stable_baselines3.common.monitor import Monitor
@@ -86,52 +86,19 @@ register(
 )
 
 my_config = {
-    "run_id": "PPO11",
+    "run_id": "PPO5",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
     "num_train_envs": 1,
     "epoch_num": 50,
-    "eval_episode_num": 1,
-    "prompt_pool_size": 256,
+    "eval_episode_num": 5,
+    "prompt_pool_size": 1000,
     "iterations_per_prompt": 1,
 }
 
-my_config["rollout_steps"] = 13 * 16
 my_config["timesteps_per_epoch"] = my_config["prompt_pool_size"] * 13 * my_config["iterations_per_prompt"]
 
-class WandbEpisodeLogger(BaseCallback):
-    """Callback to log custom episode metrics to wandb"""
-    
-    def __init__(self, verbose=0):
-        super().__init__(verbose)
-    
-    def _on_step(self) -> bool:
-        # Check if any episode ended
-        infos = self.locals.get('infos', [])
-        for info in infos:
-            if 'episode' in info:
-                episode_info = info['episode']
-                wandb.log(
-                    {
-                        # Episode-level aggregates from Monitor
-                        'custom/ep_rew': episode_info.get('r', 0),
-                        'custom/ep_len': episode_info.get('l', 0),
-                        # Per-episode averages/last values of our custom metrics
-                        'custom/quality_reward': episode_info.get('quality_reward', 0),
-                        'custom/speed_reward': episode_info.get('speed_reward', 0),
-                        'custom/quality_score': episode_info.get('quality_score', 0),
-                        'custom/speed_score': episode_info.get('speed_score', 0),
-                        'custom/total_reward': episode_info.get('total_reward', 0),
-                        'custom/psnr': episode_info.get('psnr', 0),
-                        'custom/ms_ssim': episode_info.get('ms_ssim', 0),
-                        'custom/lpips': episode_info.get('lpips', 0),
-                        'custom/prune_ratio': episode_info.get('prune_ratio', 0),
-                    },
-                    step=self.num_timesteps,
-                )
-        
-        return True
 
 def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt):
     # env = gym.make('var-v0')
@@ -212,18 +179,18 @@ def train(eval_env, model, config):
         epoch_start_time = time.time()
         
         # Enable wandb logging with both WandbCallback and custom episode logger
-        callback_list = [
-            WandbCallback(
-                gradient_save_freq=0,  # disable gradient logging to reduce artifact size
-                verbose=0,
-            ),
-            WandbEpisodeLogger()
-        ]
+        # callback_list = [
+        #     WandbCallback(
+        #         gradient_save_freq=0,  # disable gradient logging to reduce artifact size
+        #         verbose=0,
+        #     ),
+        #     WandbEpisodeLogger()
+        # ]
 
         model.learn(
             total_timesteps=config["timesteps_per_epoch"],
             reset_num_timesteps=False,
-            callback=callback_list,
+            # callback=callback_list,
         )
 
         epoch_duration = time.time() - epoch_start_time
@@ -245,12 +212,12 @@ def train(eval_env, model, config):
         print(f"   - Avg Quality Score: {avg_quality:.3f}")
         print(f"   - Avg Speed Score: {avg_speed:.3f}")
         
-        wandb.log({
-            "eval/avg_return": avg_return,
-            "eval/avg_quality": avg_quality,
-            "eval/avg_speed": avg_speed,
-            "epoch": epoch + 1,
-        })
+        # wandb.log({
+        #     "eval/avg_return": avg_return,
+        #     "eval/avg_quality": avg_quality,
+        #     "eval/avg_speed": avg_speed,
+        #     "epoch": epoch + 1,
+        # })
         
         ### Save best model (by average return)
         if avg_return > current_best_return:
@@ -291,14 +258,14 @@ def measure_peak_memory():
 
 if __name__ == "__main__":
     # Create wandb session
-    run = wandb.init(
-        project="FastVAR_Infinity",
-        name=my_config["run_id"],
-        config=my_config,
-        sync_tensorboard=True,
-        id=my_config["run_id"],
-        resume="allow",
-    )
+    # run = wandb.init(
+    #     project="FastVAR_Infinity",
+    #     name=my_config["run_id"],
+    #     config=my_config,
+    #     sync_tensorboard=True,
+    #     id=my_config["run_id"],
+    #     resume="allow",
+    # )
 
     model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_2b_reg.pth'
     vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/checkpoint/infinity_vae_d32reg.pth'
@@ -371,6 +338,18 @@ if __name__ == "__main__":
     # load infinity
     infinity = load_transformer(vae, args)
 
+    #### load PPO model
+    load_model = True
+    if load_model:
+
+        OBS_H, OBS_W = 64, 64
+        OBS_CHANNELS = 32 + 1  # 32 code channels + 1 scale channel
+        SKIP_FIRST_N_SCALES = 9
+
+        trained_model_path = './best_PPO5.zip'
+        print(f"Loading PPO Agent from {trained_model_path}...")
+        model = PPO.load(trained_model_path, device='cuda')
+
     cfg_value = 4
     tau_value = 0.5
     h_div_w = 1 / 1  # aspect ratio, height:width
@@ -389,79 +368,197 @@ if __name__ == "__main__":
     # global metadata for all prompts (optional, stored in base_output_dir)
     global_prompt_records = []
 
+    
     # Create a single model that learns across all prompts
     print(f"Creating environments for {len(prompts)} prompts...")
     
     # Create training environments: each env receives the full prompt list and
     # VAREnv will rotate to a new prompt on each episode via reset().
     prompt_list = list(prompts.values())
-    
-    def make_env_factory(prompts_for_env):
-        """Factory function to create env with a prompt pool (fixes closure issue)."""
-        def _make():
-            return make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompts_for_env)
-        return _make
-    
-    train_env = DummyVecEnv([
-        make_env_factory(prompt_list)
-        for _ in range(my_config["num_train_envs"])
-    ])
-    
-    # For eval, also use the same prompt pool (episodes will cycle through prompts)
-    eval_env = DummyVecEnv([
-        make_env_factory(prompt_list)
-    ])
-    
-    print("Creating model...")
-    device = 'cuda'
-    policy_kwargs = dict(
-        features_extractor_class=FastVARCNNExtractor,
-        features_extractor_kwargs=dict(features_dim=256, width=64),
-        normalize_images=False,
-    )
-    # model = my_config["algorithm"](
-    #     my_config["policy_network"], 
-    #     train_env,
-    #     verbose=0,
-    #     tensorboard_log=my_config["run_id"],
-    #     policy_kwargs=policy_kwargs,
-    #     device = device,
-    #     n_steps=my_config["timesteps_per_epoch"]
-    # )
 
-    if my_config["algorithm"] == PPO:
-        model = my_config["algorithm"](
-            my_config["policy_network"],
-            train_env,
-            verbose=0,
-            tensorboard_log=my_config["run_id"],
-            policy_kwargs=policy_kwargs,
-            device=device,
-            # PPO-specific hyperparams
-            n_steps=my_config["rollout_steps"],  
-            batch_size=104,                      
-            n_epochs=4,                          
-            learning_rate=1e-4,                  
-            ent_coef=0.001,                      
-        )
-    elif my_config["algorithm"] == SAC:
-        model = my_config["algorithm"](
-            my_config["policy_network"],
-            train_env,
-            verbose=0,
-            tensorboard_log=my_config["run_id"],
-            policy_kwargs=policy_kwargs,
-            device=device,
-            # SAC-specific hyperparams
-            batch_size=256,
-            train_freq=1,
-            gradient_steps=4,     
-            learning_rate=3e-4,
-            buffer_size=20000,      # small, safe
-            learning_starts=130,
-            tau=0.005,
-            gamma=0.99,
-        )
+    cfg_list=[cfg_value] * len(scale_schedule)
+    tau_list=[tau_value] * len(scale_schedule)
+    negative_prompt=''
+    scale_schedule=scale_schedule
+    top_k=900
+    top_p=0.97
+    cfg_sc=3
+    cfg_exp_k=0.0
+    cfg_insertion_layer=-5
+    vae_type=1
+    gumbel=0
+    softmax_merge_topk=-1
+    gt_leak=0
+    gt_ls_Bl=None
+    g_seed=0
+    sampling_per_bits=1
+    enable_positive_prompt=0
+    save_intermediate_results=False
+    save_dir=None
+    per_scale_infer=True
 
-    print(f"Starting training on {len(prompts)} prompts...")
-    train(eval_env, model, my_config)
+    for image_num, prompt in enumerate(prompt_list):
+        consume_time = 0
+
+        if not isinstance(cfg_list, list):
+            cfg_list = [cfg_list] * len(scale_schedule)
+        if not isinstance(tau_list, list):
+            tau_list = [tau_list] * len(scale_schedule)
+        text_cond_tuple = encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt)
+        if negative_prompt:
+            negative_label_B_or_BLT = encode_prompt(text_tokenizer, text_encoder, negative_prompt)
+        else:
+            negative_label_B_or_BLT = None
+        # print(f'cfg: {cfg_list}, tau: {tau_list}')
+            if per_scale_infer:
+                # Use step-wise generation via `infer_pruned_per_scale`, iterating all scales.
+                # This matches `autoregressive_infer_cfg` behavior (VAE / bit-label path)
+                # while allowing dynamic per-scale pruning.
+
+                if vae_type == 0 or not getattr(infinity, "use_bit_label", True):
+                    raise NotImplementedError(
+                        "per_scale_infer=True is currently supported only for vae_type != 0 "
+                        "and use_bit_label == True."
+                    )
+
+                # Ensure cfg_insertion_layer is a list, as expected by the model.
+                if not isinstance(cfg_insertion_layer, (list, tuple)):
+                    cfg_insertion_layer_ = [cfg_insertion_layer]
+                else:
+                    cfg_insertion_layer_ = list(cfg_insertion_layer)
+
+                state = None
+                summed_codes = None
+                img = None
+
+                num_scales = len(scale_schedule)
+
+                for si in range(num_scales):
+                    if load_model is not True:
+                        prune_ratio = get_pruning_ratio(si, num_scales)
+                    else:
+                        if summed_codes is not None:
+                            # Match VAREnv interpolation logic
+                            interp_mode = getattr(
+                                getattr(vae, "quantizer", None),
+                                "z_interplote_up",
+                                "area",
+                            )
+                            # Resize [B, C, H, W] -> [B, C, 64, 64]
+                            resized = F.interpolate(
+                                summed_codes, 
+                                size=(1, OBS_H, OBS_W), 
+                                mode=interp_mode
+                            ) 
+                            # Extract single item [32, 64, 64] and move to CPU/Float
+                            codes_resized = resized.squeeze(-3)[0].cpu().float()
+                        else:
+                            # First step: Empty codes
+                            codes_resized = torch.zeros(OBS_CHANNELS - 1, OBS_H, OBS_W, dtype=torch.float32)
+                        norm_scale = float(si / max(num_scales - 1, 1))
+                        scale_plane = torch.full(
+                            (1, OBS_H, OBS_W),
+                            norm_scale,
+                            dtype=codes_resized.dtype,
+                            device=codes_resized.device,
+                        )
+
+                        # C. Concatenate and Convert to Numpy for PPO
+                        full_obs_tensor = torch.cat([codes_resized, scale_plane], dim=0)
+                        obs = full_obs_tensor.numpy().astype(np.float32)
+                        if si < SKIP_FIRST_N_SCALES:
+                            prune_ratio = 0.0
+                        else:
+                            # print(obs)
+                            # Predict action
+                            action, _ = model.predict(obs, deterministic=True)
+                            # print(action)
+                            # Convert Action [-1, 1] -> Pruning Ratio [0, 1]
+                            prune_ratio = (float(action[0]) + 1) * 0.5
+                            prune_ratio = max(0.0, min(1.0, prune_ratio))
+                            if prune_ratio > 0.95:
+                                prune_ratio = 1.0
+                    start_time = time.time()
+                    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+                        codes, summed_codes, img, state = infinity.infer_pruned_per_scale(
+                            vae=vae,
+                            scale_schedule=scale_schedule,
+                            label_B_or_BLT=text_cond_tuple,
+                            scale_ind=si,
+                            prune_ratio=prune_ratio,
+                            B=1,
+                            negative_label_B_or_BLT=negative_label_B_or_BLT,
+                            g_seed=g_seed if si == 0 else None,
+                            cfg_list=cfg_list,
+                            tau_list=tau_list,
+                            cfg_sc=cfg_sc,
+                            top_k=top_k,
+                            top_p=top_p,
+                            returns_vemb=1,
+                            cfg_insertion_layer=cfg_insertion_layer_,
+                            vae_type=vae_type,
+                            trunk_scale=1000,
+                            gt_leak=gt_leak if gt_leak >= 0 else 0,
+                            gt_ls_Bl=gt_ls_Bl,
+                            inference_mode=True,
+                            sampling_per_bits=sampling_per_bits,
+                            save_intermediate_results=save_intermediate_results,
+                            save_dir=save_dir,
+                            state=state,
+                        )
+                    consume_time += time.time() - start_time
+
+                # One full image (all scales) is done; reset print cache so pruning
+                # ratio logs are emitted again for the next image.
+                reset_prune_print_cache()
+
+                # `img` is already the decoded uint8 image for the final scale.
+                img_list = [img]
+
+            else:
+                _, intermidiate_list, img_list = infinity.autoregressive_infer_cfg(
+                    vae=vae,
+                    scale_schedule=scale_schedule,
+                    label_B_or_BLT=text_cond_tuple,
+                    g_seed=g_seed,
+                    B=1,
+                    negative_label_B_or_BLT=negative_label_B_or_BLT,
+                    force_gt_Bhw=None,
+                    cfg_sc=cfg_sc,
+                    cfg_list=cfg_list,
+                    tau_list=tau_list,
+                    top_k=top_k,
+                    top_p=top_p,
+                    returns_vemb=1,
+                    ratio_Bl1=None,
+                    gumbel=gumbel,
+                    norm_cfg=False,
+                    cfg_exp_k=cfg_exp_k,
+                    cfg_insertion_layer=cfg_insertion_layer,
+                    vae_type=vae_type,
+                    softmax_merge_topk=softmax_merge_topk,
+                    ret_img=True,
+                    trunk_scale=1000,
+                    gt_leak=gt_leak,
+                    gt_ls_Bl=gt_ls_Bl,
+                    inference_mode=True,
+                    sampling_per_bits=sampling_per_bits,
+                    save_intermediate_results=save_intermediate_results,
+                    save_dir=save_dir,
+                )
+
+        # img_list elements are batched tensors [B, H, W, C]; for our single-image
+        # inference we return the first item in the batch.
+        img = img_list[0]
+        if isinstance(img, torch.Tensor) and img.dim() == 4 and img.shape[0] == 1:
+            img = img[0]
+
+        file = open("consume_time.txt", "a")
+        file.write(str(image_num).zfill(4) + ": " + str(consume_time) + "\n")
+        file.close()
+
+        root_output_dir = os.path.join(base_output_dir, f"gen_images_people")
+        os.makedirs(root_output_dir, exist_ok=True)
+        img_path = os.path.join(root_output_dir, str(image_num) + ".jpg")
+        cv2.imwrite(img_path, img.cpu().numpy())
+        print(f"Saved image for people to {os.path.abspath(img_path)}")

@@ -56,7 +56,7 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
 
 class VAREnv(gym.Env):
     def __init__(self, infinity_test, vae, scale_schedule, text_tokenizer, text_encoder, prompt,
-                 alpha: float = 1, beta: float = 2, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/golden_images"):
+                 alpha: float = 1.0, beta: float = 1.0, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/golden_images"):
         self.infinity_test = infinity_test
         self.vae = vae
         self.scale_schedule = scale_schedule
@@ -192,10 +192,14 @@ class VAREnv(gym.Env):
                 except OSError:
                     pass
 
-        # Save RNG state to prevent side effects on the pruned generation process
-        # This ensures that generating golden images (which consumes random numbers)
-        # doesn't desynchronize the RNG for the next step of the pruned generation.
+        # ------------------------------------------------------------------
+        # CRITICAL FIX: Save ALL RNG states (Local + Global CPU + Global CUDA)
+        # This prevents the golden generation loop from advancing the global 
+        # random state that the subsequent RL step relies on.
+        # ------------------------------------------------------------------
         rng_state = self.infinity_test.rng.get_state()
+        torch_cpu_rng_state = torch.get_rng_state()
+        torch_cuda_rng_state = torch.cuda.get_rng_state()
 
         try:
             with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
@@ -246,8 +250,12 @@ class VAREnv(gym.Env):
                         torch.save(summed_codes.cpu(), codes_path)
                         self._golden_codes[si] = summed_codes.cpu()
         finally:
-            # Restore RNG state so the pruned generation sequence continues uninterrupted
+            # ------------------------------------------------------------------
+            # RESTORE ALL RNG STATES
+            # ------------------------------------------------------------------
             self.infinity_test.rng.set_state(rng_state)
+            torch.set_rng_state(torch_cpu_rng_state)
+            torch.cuda.set_rng_state(torch_cuda_rng_state)
 
     @staticmethod
     def _psnr(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> float:
@@ -347,7 +355,7 @@ class VAREnv(gym.Env):
             psnr_norm = max(min(psnr_val / 50.0, 1.0), 0.0)
             ms_ssim_norm = max(min(ms_ssim_val, 1.0), 0.0)
             lpips_norm = max(min(lpips_val, 1.0), 0.0)
-            similarity = ms_ssim_norm + (1.0 - lpips_norm)
+            similarity = ms_ssim_norm**2 + (1.0 - lpips_norm)**2
             return {
                 "psnr": psnr_val,
                 "ms_ssim": ms_ssim_val,
@@ -357,7 +365,6 @@ class VAREnv(gym.Env):
                 "lpips_norm": lpips_norm,
                 "similarity": similarity,
             }
-
 
     def step(
         self, 
@@ -513,7 +520,7 @@ class VAREnv(gym.Env):
             # Optional debug dump at the last scale
             if current_scale == len(self.scale_schedule) - 1:
                 # larger weight for the last scale
-                quality_score *= 2.0
+                quality_score *= 3.0
                 # create save_dir if not exists
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
