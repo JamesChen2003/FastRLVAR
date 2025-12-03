@@ -27,6 +27,10 @@ try:
     import clip
 except ImportError:
     clip = None
+try:
+    import ImageReward as RM
+except ImportError:
+    clip = None
 sys.path.append("/nfs/home/tensore/RL/FastRLVAR/VIEScore")
 
 import viescore
@@ -35,15 +39,15 @@ import viescore
 # ==========================================
 ENABLE_METRICS = {
     # Similarity (需要 Original 對照)
-    "psnr": True,
-    "ssim": True,
-    "lpips": True,
+    "psnr": False,
+    "ssim": False,
+    "lpips": False,
     
     # Quality (無需 Original，需要 Prompt)
-    "clip_score": True,
-    "image_reward": False,  # 需安裝 ImageReward 環境有點問題
-    "viescore": True,     # 需自定義模型
-    "geneval": True       # 需自定義模型
+    "clip_score": False,
+    "image_reward": True,  # 需安裝 ImageReward 環境有點問題
+    "viescore": False,     # 需自定義模型
+    "geneval": False       # 需自定義模型
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
