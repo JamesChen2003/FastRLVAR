@@ -8,7 +8,6 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 import pandas as pd
-from collections import defaultdict
 
 # --- Metrics Libraries ---
 # 為了避免未安裝所有庫導致報錯，使用 try-import
@@ -30,7 +29,7 @@ except ImportError:
 try:
     import ImageReward as RM
 except ImportError:
-    clip = None
+    RM = None
 sys.path.append("/nfs/home/tensore/RL/FastRLVAR/VIEScore")
 
 import viescore
@@ -39,13 +38,13 @@ import viescore
 # ==========================================
 ENABLE_METRICS = {
     # Similarity (需要 Original 對照)
-    "psnr": False,
-    "ssim": False,
-    "lpips": False,
+    "psnr": True,
+    "ssim": True,
+    "lpips": True,
     
     # Quality (無需 Original，需要 Prompt)
     "clip_score": False,
-    "image_reward": True,  # 需安裝 ImageReward 環境有點問題
+    "image_reward": False,  # 需安裝 ImageReward 環境有點問題
     "viescore": False,     # 需自定義模型
     "geneval": False       # 需自定義模型
 }
@@ -107,6 +106,7 @@ class MetricsEvaluator:
         
         # 3. Initialize ImageReward
         if ENABLE_METRICS["image_reward"]:
+
             if RM is None:
                 print("Warning: ImageReward/image-reward not importable, ImageReward metric will be 0.")
                 print("  Try:  pip install ImageReward  或  pip install image-reward")
@@ -276,8 +276,21 @@ def evaluate(args):
         viescore_model_path=args.viescore_model,
     )
 
+    # 依據 ENABLE_METRICS 建立 CSV 欄位
+    metric_flags = [
+        ("PSNR", "psnr"),
+        ("SSIM", "ssim"),
+        ("LPIPS", "lpips"),
+        ("CLIP", "clip_score"),
+        ("ImageReward", "image_reward"),
+        ("VIEScore", "viescore"),
+    ]
+    metric_columns = [name for name, flag in metric_flags if ENABLE_METRICS.get(flag, False)]
+    csv_columns = ["id"] + metric_columns
+
     fast_metadata = load_metadata(args.fast)
     rl_metadata = load_metadata(args.rl)
+    orig_metadata = load_metadata(args.orig)
     
     # 1. 讀取檔案列表
     orig_files = get_image_paths(args.orig)
@@ -287,15 +300,23 @@ def evaluate(args):
     # 確保數量一致 (以 FAST 為基準，因為 Original 可能是參考用)
     print(f"Found images -> Orig: {len(orig_files)}, FAST: {len(fast_files)}, RL: {len(rl_files)}")
     
-    # 用於儲存結果的 Dictionary
-    results = {
-        "FAST": defaultdict(list),
-        "RL": defaultdict(list)
+    # 用於儲存每張圖的結果
+    per_image_rows = {
+        "ORIGINAL": [],
+        "FAST": [],
+        "RL": []
     }
+
+    def init_row(file_id):
+        row = {"id": file_id}
+        for col in metric_columns:
+            row[col] = None
+        return row
 
     # 以 FAST 資料夾的檔案名稱為主 key
     for idx, fast_path in enumerate(tqdm(fast_files, desc="Evaluating Images")):
         filename = os.path.basename(fast_path)
+        file_id = os.path.splitext(filename)[0]
         
         # 尋找對應的 Orig 和 RL 檔案
         orig_path = os.path.join(args.orig, filename)
@@ -314,48 +335,56 @@ def evaluate(args):
             rl_img = Image.open(rl_path).convert("RGB")
 
         fast_img = Image.open(fast_path).convert("RGB")
+        fast_prompt = get_prompt_from_filename(fast_path, fast_metadata)
+        rl_prompt = get_prompt_from_filename(rl_path, rl_metadata) if rl_img is not None else None
+        orig_prompt = get_prompt_from_filename(orig_path, orig_metadata) if orig_img is not None else None
+
+        # Original 圖片的品質指標
+        if orig_img is not None:
+            orig_row = init_row(file_id)
+            if ENABLE_METRICS["clip_score"]:
+                orig_row["CLIP"] = evaluator.calc_clip_score(orig_img, orig_prompt)
+            if ENABLE_METRICS["image_reward"]:
+                orig_row["ImageReward"] = evaluator.calc_image_reward(orig_img, orig_prompt)
+            if ENABLE_METRICS["viescore"]:
+                orig_row["VIEScore"] = evaluator.calc_viescore(orig_img, orig_prompt)
+            per_image_rows["ORIGINAL"].append(orig_row)
         
         # 定義要測試的目標 (Target) 與 對照組 (Reference)
         # 我們要測試 FAST 和 RL
         targets = [
-            ("FAST", fast_img),
-            ("RL", rl_img)
+            ("FAST", fast_img, fast_prompt),
+            ("RL", rl_img, rl_prompt)
         ]
 
-        for name, img in targets:
+        for name, img, prompt in targets:
             if img is None: continue
             
             img_np = np.array(img)
-
-            # 取得 Prompt (用於 Quality Metrics)，優先從各資料夾的 metadata.json/meta_data.json
-            if name == "FAST":
-                prompt = get_prompt_from_filename(fast_path, fast_metadata)
-            elif name == "RL":
-                prompt = get_prompt_from_filename(rl_path, rl_metadata)
-            else:
-                prompt = get_prompt_from_filename(fast_path, fast_metadata)
+            row = init_row(file_id)
 
             # --- Similarity Metrics (Requires Original) ---
             if orig_img is not None:
                 if ENABLE_METRICS["psnr"] and psnr_metric:
-                    results[name]["PSNR"].append(evaluator.calc_psnr(orig_np, img_np))
+                    row["PSNR"] = evaluator.calc_psnr(orig_np, img_np)
                 
                 if ENABLE_METRICS["ssim"] and ssim_metric:
-                    results[name]["SSIM"].append(evaluator.calc_ssim(orig_np, img_np))
+                    row["SSIM"] = evaluator.calc_ssim(orig_np, img_np)
                 
                 if ENABLE_METRICS["lpips"]:
-                    results[name]["LPIPS"].append(evaluator.calc_lpips(orig_img, img))
+                    row["LPIPS"] = evaluator.calc_lpips(orig_img, img)
 
             # --- Quality Metrics (No Original Needed) ---
             if ENABLE_METRICS["clip_score"]:
-                results[name]["CLIP"].append(evaluator.calc_clip_score(img, prompt))
+                row["CLIP"] = evaluator.calc_clip_score(img, prompt)
             
             if ENABLE_METRICS["image_reward"]:
-                results[name]["ImageReward"].append(evaluator.calc_image_reward(img, prompt))
+                row["ImageReward"] = evaluator.calc_image_reward(img, prompt)
             
             if ENABLE_METRICS["viescore"]:
-                results[name]["VIEScore"].append(evaluator.calc_viescore(img, prompt))
+                row["VIEScore"] = evaluator.calc_viescore(img, prompt)
 
+            per_image_rows[name].append(row)
 
     # ==========================================
     # Summary & Output
@@ -365,32 +394,51 @@ def evaluate(args):
     print("="*50)
 
     final_data = {}
-    
-    for model_name in ["FAST", "RL"]:
-        model_res = results[model_name]
-        if not model_res: continue
-        
+    for model_name in ["FAST", "RL", "ORIGINAL"]:
+        rows = per_image_rows[model_name]
+        if not rows:
+            continue
+        df_model = pd.DataFrame(rows)
         averages = {}
-        for metric, values in model_res.items():
-            if len(values) > 0:
-                averages[metric] = np.mean(values)
-            else:
-                averages[metric] = 0.0
+        for col in metric_columns:
+            if col not in df_model.columns:
+                continue
+            series = pd.to_numeric(df_model[col], errors="coerce")
+            series = series[series.notna()]
+            averages[col] = series.mean() if not series.empty else 0.0
         final_data[model_name] = averages
 
     # Convert to DataFrame for pretty printing
-    df = pd.DataFrame(final_data).T
-    # 調整欄位順序
-    cols = ["PSNR", "SSIM", "LPIPS", "CLIP", "ImageReward", "VIEScore"]
-    cols = [c for c in cols if c in df.columns]
-    df = df[cols]
+    summary_df = pd.DataFrame(final_data).T
+    cols = [c for c in metric_columns if c in summary_df.columns]
+    summary_df = summary_df[cols]
     
-    print(df.to_string(float_format="{:.4f}".format))
+    if not summary_df.empty:
+        print(summary_df.to_string(float_format="{:.4f}".format))
+    else:
+        print("No metrics computed.")
     print("="*50)
     
-    # Save to CSV
-    df.to_csv("evaluation_results.csv")
+    # Save summary to CSV
+    summary_df.to_csv("evaluation_results.csv")
     print("Results saved to evaluation_results.csv")
+
+    # 存成三個 CSV 檔 (Original / FAST / RL)
+    def save_csv(rows, filename):
+        if not rows:
+            print(f"No data for {filename}, skip saving.")
+            return
+        df = pd.DataFrame(rows)
+        for col in csv_columns:
+            if col not in df.columns:
+                df[col] = None
+        df = df[csv_columns]
+        df.to_csv(filename, index=False)
+        print(f"Saved per-image metrics to {filename}")
+
+    save_csv(per_image_rows["ORIGINAL"], "orignal.csv")
+    save_csv(per_image_rows["FAST"], "FastVar.csv")
+    save_csv(per_image_rows["RL"], "RL.csv")
 
 
 if __name__ == "__main__":

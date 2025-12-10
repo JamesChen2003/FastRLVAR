@@ -23,6 +23,7 @@ import json
 import torch
 import cv2
 import numpy as np
+import re
 from tools.run_infinity import *
 from contextlib import contextmanager
 import gc
@@ -93,7 +94,7 @@ my_config = {
     "num_train_envs": 1,
     "epoch_num": 50,
     "eval_episode_num": 5,
-    "prompt_pool_size": 1000,
+    "prompt_pool_size": 500,
     "iterations_per_prompt": 1,
 }
 
@@ -256,6 +257,32 @@ def measure_peak_memory():
     peak_memory = torch.cuda.max_memory_allocated() / 1024 / 1024
     print(f'memory consumption: {peak_memory:.2f} MB')
 
+
+def prepare_run_dir(base_output_dir: str) -> str:
+    """
+    Create a new run directory under base_output_dir, e.g. results/run1, run2, ...
+    (same pattern as inference_for_eval.py)
+    """
+    os.makedirs(base_output_dir, exist_ok=True)
+    max_run_idx = 0
+    for name in os.listdir(base_output_dir):
+        match = re.match(r"run(\d+)$", name)
+        if match:
+            max_run_idx = max(max_run_idx, int(match.group(1)))
+    run_dir = os.path.join(base_output_dir, f"run{max_run_idx + 1}")
+    os.makedirs(run_dir, exist_ok=False)
+    return run_dir
+
+
+def save_used_metadata(run_dir: str, used_metadata: dict):
+    """
+    Save a meta_data.json describing all prompts used in this run.
+    """
+    meta_output_path = os.path.join(run_dir, "meta_data.json")
+    with open(meta_output_path, "w", encoding="utf-8") as f:
+        json.dump(used_metadata, f, ensure_ascii=False, indent=4)
+    print(f"Wrote metadata for generated prompts to {os.path.abspath(meta_output_path)}")
+
 if __name__ == "__main__":
     # Create wandb session
     # run = wandb.init(
@@ -292,9 +319,11 @@ if __name__ == "__main__":
     #     # "man":       "A detailed photo-realistic image of a man."
     # }
 
-    # Base results dir; each prompt gets its own subfolder
+    # Base results dir; each run gets its own subfolder (run1, run2, ...)
     base_output_dir = "results"
     os.makedirs(base_output_dir, exist_ok=True)
+    run_output_dir = prepare_run_dir(base_output_dir)
+    print(f"Saving outputs to {os.path.abspath(run_output_dir)}")
 
     # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
     # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
@@ -348,12 +377,26 @@ if __name__ == "__main__":
 
         trained_model_path = './checkpoint/best_PPO_v4.zip'
         print(f"Loading PPO Agent from {trained_model_path}...")
-        model = PPO.load(trained_model_path, device='cuda')
+        # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (33, 64, 64)) 報錯
+        policy_kwargs = dict(
+            features_extractor_class=FastVARCNNExtractor,
+            # features_extractor_kwargs=dict(features_dim=128, width=32),
+            features_extractor_kwargs=dict(features_dim=256, width=64),
+            normalize_images=False,
+        )
+        custom_objects = {
+            "policy_kwargs": policy_kwargs,
+        }
+        model = PPO.load(
+            trained_model_path,
+            device='cuda',
+            custom_objects=custom_objects,
+        )
 
     cfg_value = 4
     tau_value = 0.5
     h_div_w = 1 / 1  # aspect ratio, height:width
-    seed = 42
+    seed = 0
     enable_positive_prompt = 0
 
     h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
@@ -372,9 +415,8 @@ if __name__ == "__main__":
     # Create a single model that learns across all prompts
     print(f"Creating environments for {len(prompts)} prompts...")
     
-    # Create training environments: each env receives the full prompt list and
-    # VAREnv will rotate to a new prompt on each episode via reset().
-    prompt_list = list(prompts.values())
+    # Keep both id and text for each prompt so we can save {Id}.jpg and metadata
+    prompt_items = list(prompts.items())
 
     cfg_list=[cfg_value] * len(scale_schedule)
     tau_list=[tau_value] * len(scale_schedule)
@@ -397,7 +439,10 @@ if __name__ == "__main__":
     save_dir=None
     per_scale_infer=True
 
-    for image_num, prompt in enumerate(prompt_list):
+    used_metadata = {}
+
+    for image_num, (img_id, prompt) in enumerate(prompt_items):
+        start_time_total = time.time()
         consume_time = 0
 
         if not isinstance(cfg_list, list):
@@ -553,12 +598,23 @@ if __name__ == "__main__":
         if isinstance(img, torch.Tensor) and img.dim() == 4 and img.shape[0] == 1:
             img = img[0]
 
-        file = open("consume_time.txt", "a")
-        file.write(str(image_num).zfill(4) + ": " + str(consume_time) + "\n")
-        file.close()
+        with open("consume_time.txt", "a") as file:
+            file.write(f'{img_id}: {consume_time}\n')
 
-        root_output_dir = os.path.join(base_output_dir, f"gen_images_people")
-        os.makedirs(root_output_dir, exist_ok=True)
-        img_path = os.path.join(root_output_dir, str(image_num) + ".jpg")
+        total_elapsed = time.time() - start_time_total
+        with open("total_consume_time.txt", "a") as file:
+            file.write(f'{img_id}: {total_elapsed}\n')
+
+        img_path = os.path.join(run_output_dir, f"{img_id}.jpg")
         cv2.imwrite(img_path, img.cpu().numpy())
-        print(f"Saved image for people to {os.path.abspath(img_path)}")
+        print(f"Saved image for {img_id} to {os.path.abspath(img_path)} (total {total_elapsed:.2f}s, infer-only {consume_time:.2f}s)")
+
+        # Collect metadata for this image id so we can write a meta_data.json
+        # that mirrors the structure used by inference_for_eval.py
+        if img_id in meta_data:
+            used_metadata[img_id] = meta_data[img_id]
+        else:
+            used_metadata[img_id] = {"prompt": prompt}
+
+    # Save metadata for all generated images in this run
+    save_used_metadata(run_output_dir, used_metadata)

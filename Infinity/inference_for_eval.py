@@ -16,7 +16,8 @@ model_path = '/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
 vae_path = '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
 text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
-DEFAULT_META_PATH = "/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json"
+# DEFAULT_META_PATH = "/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json"
+DEFAULT_META_PATH = "/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json"
 DEFAULT_CATEGORY = "people"
 pruning_scales = "48:1.0,64:1.0"
 
@@ -92,7 +93,7 @@ def parse_cli_args():
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
+        default=0,
         help="Base seed for prompt selection and image generation.",
     )
     return parser.parse_args()
@@ -200,7 +201,7 @@ def main():
                     text_tokenizer,
                     text_encoder,
                     prompt_text,
-                    g_seed=cli_args.seed + idx,   # different seed per prompt
+                    g_seed=0,   # fixed seed
                     gt_leak=0,
                     gt_ls_Bl=None,
                     cfg_list=[cfg_value] * len(scale_schedule),
