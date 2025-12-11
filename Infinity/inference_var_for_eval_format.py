@@ -368,7 +368,7 @@ if __name__ == "__main__":
     infinity = load_transformer(vae, args)
 
     #### load PPO model
-    load_model = True
+    load_model = False
     if load_model:
 
         OBS_H, OBS_W = 64, 64
@@ -402,7 +402,7 @@ if __name__ == "__main__":
     h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
     scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
-    print(scale_schedule)
+    # print(scale_schedule)
 
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
@@ -479,6 +479,7 @@ if __name__ == "__main__":
                 num_scales = len(scale_schedule)
 
                 for si in range(num_scales):
+                    decode_img = si == num_scales - 1
                     if load_model is not True:
                         prune_ratio = get_pruning_ratio(si, num_scales)
                         print(prune_ratio)
@@ -524,8 +525,7 @@ if __name__ == "__main__":
                             prune_ratio = max(0.0, min(1.0, prune_ratio))
                             if prune_ratio > 0.95:
                                 prune_ratio = 1.0
-                    torch.cuda.synchronize()
-                    start_time = time.time()
+                    start_event.record()
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
                         codes, summed_codes, img, state = infinity.infer_pruned_per_scale(
                             vae=vae,
@@ -552,9 +552,16 @@ if __name__ == "__main__":
                             save_intermediate_results=save_intermediate_results,
                             save_dir=save_dir,
                             state=state,
+                            decode_img=decode_img,
                         )
+                    end_event.record()
                     torch.cuda.synchronize()
-                    consume_time += time.time() - start_time
+                    consume_time += start_event.elapsed_time(end_event) / 1000.0
+
+                if img is None and isinstance(summed_codes, torch.Tensor):
+                    img = vae.decode(summed_codes.squeeze(-3))
+                    img = (img + 1) / 2
+                    img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
 
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.
