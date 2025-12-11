@@ -56,7 +56,7 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
 
 class VAREnv(gym.Env):
     def __init__(self, infinity_test, vae, scale_schedule, text_tokenizer, text_encoder, prompt, 
-                 alpha: float = 1.0, beta: float = 0.01, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/golden_images"): # r14_jameschen-1000043/FastVAR/Infinity/golden_images #d10_rick_huang-1000011/RL/RL_final_project/FastRLVAR/golden_images
+                 alpha: float = 1.0, beta: float = 1/200.0, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/golden_images"): # r14_jameschen-1000043/FastVAR/Infinity/golden_images #d10_rick_huang-1000011/RL/RL_final_project/FastRLVAR/golden_images
         self.infinity_test = infinity_test
         self.vae = vae
         self.scale_schedule = scale_schedule

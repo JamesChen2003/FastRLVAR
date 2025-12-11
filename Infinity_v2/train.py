@@ -86,7 +86,7 @@ register(
 )
 
 my_config = {
-    "run_id": "entropy_PPO1",
+    "run_id": "entropy_PPO3",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
