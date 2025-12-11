@@ -82,8 +82,8 @@ def get_pruning_ratio(scale: int, num_scales: int) -> float:
     # Apply pruning only to the last few scales.
     N = min(5, num_scales)
     tail_pattern = [
-        [0.0, 0, 0, 0, 0][:N],
-        [0.0, 0, 0, 0, 0][:N],
+        [0.0, 0.4, 1, 1, 1][:N],
+        [0.0, 0.4, 1, 1, 1][:N],
         # [0.8, 0.7, 0.6, 1.0, 1.0][:N]
         ]
     prune_scale_list[-N:] = tail_pattern[image_num % 2]
