@@ -41,15 +41,18 @@ runs/
 run/
 training_tmp_results/
 Infinity/training_tmp_results/
+Infinity_v2/training_tmp_results/
 
 results/
 Infinity/results/
+Infinity_v2/results/
 
 ############################################################
 # wandb / TensorBoard (all experiment artifacts)
 ############################################################
 wandb/
 Infinity/wandb/
+Infinity_v2/wandb/
 **/wandb/
 events.out.tfevents.*
 
@@ -57,11 +60,21 @@ events.out.tfevents.*
 # RL run directories (checkpoint dumps, not source)
 ############################################################
 Infinity/A2C1/
+Infinity/SAC1/
 Infinity/PPO1/
 Infinity/PPO2/
 Infinity/PPO3/
 Infinity/PPO4/
 Infinity/PPO5/
+Infinity/PPO6/
+Infinity/PPO7/
+Infinity/PPO8/
+Infinity/PPO9/
+Infinity/PPO10/
+Infinity/PPO11/
+
+Infinity_v2/entropy_PPO1/
+
 
 ############################################################
 # Model weights / checkpoints / large tensors
@@ -74,8 +87,10 @@ Infinity/PPO5/
 *.npz
 *.npy
 
-# Infinity checkpoints (keep script, ignore weights)
+# Infinity_v2 checkpoints (keep script, ignore weights)
+
 Infinity/checkpoint/*.pth
+Infinity_v2/checkpoint/*.pth
 
 # Generic model directories that usually only contain weights
 **/checkpoints/
@@ -87,6 +102,10 @@ Infinity/checkpoint/*.pth
 Infinity/evaluation/MJHQ30K/
 Infinity/evaluation/MJHQ30K/mjhq30k_imgs/
 Infinity/evaluation/MJHQ30K/output/
+
+Infinity_v2/evaluation/MJHQ30K/
+Infinity_v2/evaluation/MJHQ30K/mjhq30k_imgs/
+Infinity_v2/evaluation/MJHQ30K/output/
 
 ############################################################
 # Image / video data (keep small assets/, ignore everything else)
