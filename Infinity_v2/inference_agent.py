@@ -86,14 +86,14 @@ register(
 )
 
 my_config = {
-    "run_id": "PPO5",
+    "run_id": "entropy_PPO3",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
     "num_train_envs": 1,
     "epoch_num": 50,
     "eval_episode_num": 5,
-    "prompt_pool_size": 1000,
+    "prompt_pool_size": 1,
     "iterations_per_prompt": 1,
 }
 
@@ -343,10 +343,10 @@ if __name__ == "__main__":
     if load_model:
 
         OBS_H, OBS_W = 64, 64
-        OBS_CHANNELS = 32 + 1  # 32 code channels + 1 scale channel
+        OBS_CHANNELS = 32 + 32 + 1  # 32 code channels + 1 scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './best_PPO5.zip'
+        trained_model_path = './best_PPO3'
         print(f"Loading PPO Agent from {trained_model_path}...")
         model = PPO.load(trained_model_path, device='cuda')
 
@@ -466,6 +466,8 @@ if __name__ == "__main__":
                         # C. Concatenate and Convert to Numpy for PPO
                         full_obs_tensor = torch.cat([codes_resized, scale_plane], dim=0)
                         obs = full_obs_tensor.numpy().astype(np.float32)
+
+                        
                         if si < SKIP_FIRST_N_SCALES:
                             prune_ratio = 0.0
                         else:

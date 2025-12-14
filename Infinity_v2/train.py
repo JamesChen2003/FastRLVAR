@@ -86,13 +86,13 @@ register(
 )
 
 my_config = {
-    "run_id": "entropy_PPO3",
+    "run_id": "entropy_PPO9",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
     "num_train_envs": 1,
     "epoch_num": 50,
-    "eval_episode_num": 1,
+    "eval_episode_num": 10,  # Evaluate over multiple prompts for more stable metrics
     "prompt_pool_size": 256,
     "iterations_per_prompt": 1,
 }
@@ -205,6 +205,8 @@ def eval(env, model, eval_episode_num):
 def train(eval_env, model, config):
     """Train agent using SB3 algorithm and my_config"""
     current_best_return = -float("inf")
+    current_best_quality = -float("inf")
+    current_best_speed = -float("inf")
 
     start_time = time.time()
 
@@ -240,7 +242,7 @@ def train(eval_env, model, config):
         print(f"   - Epoch time: {epoch_duration:.1f}s")
         print(f"   - Eval time: {eval_duration:.1f}s")
         print(f"   - Total time: {total_duration/60:.1f} min")
-        print(f"Performance:")
+        print(f"Performance (averaged over {config['eval_episode_num']} prompts):")
         print(f"   - Avg Return: {avg_return:.3f}")
         print(f"   - Avg Quality Score: {avg_quality:.3f}")
         print(f"   - Avg Speed Score: {avg_speed:.3f}")
@@ -252,13 +254,35 @@ def train(eval_env, model, config):
             "epoch": epoch + 1,
         })
         
-        ### Save best model (by average return)
+        save_path = config["save_path"]
+        saved_any = False
+        
+        ### Save best model by average return
         if avg_return > current_best_return:
-            print("Saving New Best Model")
+            print("Saving New Best Model (by Return)")
             print(f"   - Previous best return: {current_best_return:.3f} → {avg_return:.3f}")
             current_best_return = avg_return
-            save_path = config["save_path"]
-            model.save(f"{save_path}/best")
+            model.save(f"{save_path}/best_reward")
+            saved_any = True
+        
+        ### Save best model by average quality
+        if avg_quality > current_best_quality:
+            print("Saving New Best Model (by Quality)")
+            print(f"   - Previous best quality: {current_best_quality:.3f} → {avg_quality:.3f}")
+            current_best_quality = avg_quality
+            model.save(f"{save_path}/best_quality")
+            saved_any = True
+        
+        ### Save best model by average speed
+        if avg_speed > current_best_speed:
+            print("Saving New Best Model (by Speed)")
+            print(f"   - Previous best speed: {current_best_speed:.3f} → {avg_speed:.3f}")
+            current_best_speed = avg_speed
+            model.save(f"{save_path}/best_speed")
+            saved_any = True
+        
+        if not saved_any:
+            print("No new best models this epoch")
         print("-"*60)
             
     total_time = (time.time() - start_time)
@@ -442,7 +466,12 @@ if __name__ == "__main__":
             batch_size=104,                      
             n_epochs=4,                          
             learning_rate=1e-4,                  
-            ent_coef=0.001,                      
+            ent_coef=0.001,
+            # gamma (discount factor): controls immediate vs long-term reward focus
+            # Lower gamma (0.9-0.95): focuses more on immediate/current rewards
+            # Higher gamma (0.99-0.999): focuses more on total/long-term reward
+            # Default is 0.99 if not specified
+            gamma=0.995,                          
         )
     elif my_config["algorithm"] == SAC:
         model = my_config["algorithm"](

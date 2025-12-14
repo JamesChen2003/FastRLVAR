@@ -56,7 +56,7 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
 
 class VAREnv(gym.Env):
     def __init__(self, infinity_test, vae, scale_schedule, text_tokenizer, text_encoder, prompt, 
-                 alpha: float = 1.0, beta: float = 1/200.0, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/golden_images"): # r14_jameschen-1000043/FastVAR/Infinity/golden_images #d10_rick_huang-1000011/RL/RL_final_project/FastRLVAR/golden_images
+                 alpha: float = 0.75, beta: float = 1/380.0, golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/golden_images"): # r14_jameschen-1000043/FastVAR/Infinity/golden_images #d10_rick_huang-1000011/RL/RL_final_project/FastRLVAR/golden_images
         self.infinity_test = infinity_test
         self.vae = vae
         self.scale_schedule = scale_schedule
@@ -353,7 +353,7 @@ class VAREnv(gym.Env):
             psnr_norm = max(min(psnr_val / 50.0, 1.0), 0.0)
             ms_ssim_norm = max(min(ms_ssim_val, 1.0), 0.0)
             lpips_norm = max(min(lpips_val, 1.0), 0.0)
-            similarity = ms_ssim_norm**2 + (1.0 - lpips_norm)**2
+            similarity = math.sqrt(((1.0 - lpips_norm)**2 + ms_ssim_norm**2) / 2.0)
             return {
                 "psnr": psnr_val,
                 "ms_ssim": ms_ssim_val,
@@ -363,6 +363,14 @@ class VAREnv(gym.Env):
                 "lpips_norm": lpips_norm,
                 "similarity": similarity,
             }
+
+    def quality_func(self, x, a=0.6, b=0.95):
+        if x < a:
+            return 0.0
+        elif x > b:
+            return 1.0
+        else:
+            return 0.5 * (1 - math.cos(math.pi * (x - a) / (b - a)))
 
     def step(
         self, 
@@ -396,15 +404,15 @@ class VAREnv(gym.Env):
         if current_scale >= skip_first_N_scales:
             prune_ratio = (float(action[0]) + 1) * 0.5 # map [-1, 1] to [0, 1]
             prune_ratio = max(0.0, min(1.0, prune_ratio)) # clamp to [0, 1]
-            if prune_ratio > 0.95:
-                prune_ratio = 1.0
+            # if prune_ratio > 0.95:
+            #     prune_ratio = 1.0
         else:
             prune_ratio = 0.0
         
         # speed_score encourages higher pruning (more speed)
         # weight_scale = [-0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, 0.13, 0.18, 0.32, 0.47, 1.0]
         latency_scale = [-1, -1, -1, -1, -1,  5.67, 12.60, 10.59, 33.00, 66.71, 91.40, 130.57, 268.93]
-        skip_scale    = [ 0,  0,  0,  0,  0, 14.33, 17.40,  9.41, 17.00,  3.29, 28.60,  49.43, 111.07]
+        skip_scale    = [ 0,  0,  0,  0,  0, 14.33, 17.40,  9.41, 17.00, 20.29, 28.60,  49.43, 111.07]
         # speed_score = prune_ratio * get_speed_weight()
         speed_score   = prune_ratio * latency_scale[current_scale] + (skip_scale[current_scale] if prune_ratio == 1.0 else 0)
 
@@ -547,8 +555,6 @@ class VAREnv(gym.Env):
 
             # Optional debug dump at the last scale
             if current_scale == len(self.scale_schedule) - 1:
-                # larger weight for the last scale
-                quality_score *= 3.0
                 # create save_dir if not exists
                 if not os.path.exists(save_dir):
                     os.makedirs(save_dir)
@@ -564,9 +570,11 @@ class VAREnv(gym.Env):
                     f"PSNR: {psnr_val:.2f}, MS-SSIM: {ms_ssim_val:.4f}, LPIPS: {lpips_val:.4f}"
                 )
 
-        quality_reward = self.alpha * quality_score
+        quality_reward = self.quality_func(quality_score)
         speed_reward = self.beta * speed_score
-        reward = quality_reward + speed_reward
+        # increase alpha for stronger speed reward
+        # increase beta for weaker speed reward
+        reward = quality_reward * ( (1-self.alpha) + self.alpha * speed_reward) + (1.5 * quality_reward if current_scale == len(self.scale_schedule) - 1 else 0.0)
 
         # Build observation: resize summed_codes with same interpolation mode as Infinity,
         # then append a scale-index channel. Everything is moved to CPU before
