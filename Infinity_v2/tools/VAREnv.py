@@ -364,7 +364,7 @@ class VAREnv(gym.Env):
                 "similarity": similarity,
             }
 
-    def quality_func(self, x, a=0.6, b=0.95):
+    def quality_func(self, x, a=0.625, b=0.9):
         if x < a:
             return 0.0
         elif x > b:
@@ -574,7 +574,7 @@ class VAREnv(gym.Env):
         speed_reward = self.beta * speed_score
         # increase alpha for stronger speed reward
         # increase beta for weaker speed reward
-        reward = quality_reward * ( (1-self.alpha) + self.alpha * speed_reward) + (1.5 * quality_reward if current_scale == len(self.scale_schedule) - 1 else 0.0)
+        reward = quality_reward * ( (1-self.alpha) + self.alpha * speed_reward) + (self.alpha * quality_reward if current_scale == len(self.scale_schedule) - 1 else 0.0)
 
         # Build observation: resize summed_codes with same interpolation mode as Infinity,
         # then append a scale-index channel. Everything is moved to CPU before
