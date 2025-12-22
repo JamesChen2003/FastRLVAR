@@ -36,17 +36,18 @@ def masked_previous_scale_cache(cur_x, num_remain, cur_shape):
 
 def masked_previous_scale_cache_entropy(cur_x, num_remain, cur_shape, attn_entropy):
     B, L, c = cur_x.shape
-    # mean_x = cur_x.view(B, cur_shape[1], cur_shape[2], -1).permute(0, 3, 1, 2)
-    # mean_x = torch.nn.functional.adaptive_avg_pool2d(mean_x,(1,1)).permute(0, 2, 3, 1).view(B, 1,c)
-    # mse_difference = torch.sum((cur_x - mean_x)**2,dim=-1,keepdim=True)
-    # print("MSE Difference:", mse_difference.shape)
-    # print("Attn Entropy:", attn_entropy.shape)
-    attn_entropy = torch.mean(attn_entropy, dim=1, keepdim=True).permute(0,2,1)
-    select_indices = torch.argsort(attn_entropy,dim=1,descending=True)
-    filted_select_indices=select_indices[:,:num_remain,:]
+    if attn_entropy.dim() == 3:
+        scores = attn_entropy.mean(dim=1)
+    elif attn_entropy.dim() == 2:
+        scores = attn_entropy
+    else:
+        raise ValueError(f"Expected attn_entropy with shape [B, H, L] or [B, L], got {attn_entropy.shape}")
+    num_remain = min(num_remain, scores.shape[1])
+    topk_indices = torch.topk(scores, k=num_remain, dim=1, largest=True).indices
+    filted_select_indices = topk_indices.unsqueeze(-1)
 
     def merge(merged_cur_x):
-        return torch.gather(merged_cur_x,dim=1,index=filted_select_indices.repeat(1,1,c))
+        return torch.gather(merged_cur_x, dim=1, index=filted_select_indices.expand(-1, -1, c))
 
     def unmerge(unmerged_cur_x, unmerged_cache_x, cached_hw=None):
         if unmerged_cache_x is None or cached_hw is None:
@@ -54,7 +55,7 @@ def masked_previous_scale_cache_entropy(cur_x, num_remain, cur_shape, attn_entro
         else:
             base = unmerged_cache_x.view(B, cached_hw[0], cached_hw[1], -1).permute(0, 3, 1, 2)
             base = torch.nn.functional.interpolate(base, size=(cur_shape[1], cur_shape[2]), mode='area').permute(0, 2, 3, 1).view(B, L, c)
-        base.scatter_(dim=1, index=filted_select_indices.repeat(1,1,c), src=unmerged_cur_x)
+        base.scatter_(dim=1, index=filted_select_indices.expand(-1, -1, c), src=unmerged_cur_x)
         return base
 
     def get_src_tgt_idx():

@@ -225,7 +225,7 @@ class FastVARSelfAttention(nn.Module):
         self.cached_v = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0,rope_idx=None,ori_len=0):
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, rope_idx=None, ori_len=0, need_entropy: bool = True):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -277,13 +277,16 @@ class FastVARSelfAttention(nn.Module):
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
+                oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale, **kw).view(B, L, C)
             else:                                   # inference (autoregressive sampling)
-                kw = dict()
-                q_heads, k_heads, v_heads = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                attn_out, entropy_scores, _ = flash_attention_entropy(
-                    q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
-                )
-            oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale, **kw).view(B, L, C)
+                if need_entropy:
+                    q_heads, k_heads, v_heads = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                    attn_out, entropy_scores, _ = flash_attention_entropy(
+                        q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
+                    )
+                    oup = attn_out.transpose(1, 2).reshape(B, L, C)
+                else:
+                    oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale).view(B, L, C)
         else:
             # if self.cos_attn: q, k are in fp32; v is in bf16
             # else: q, k, v are in bf16
@@ -291,10 +294,7 @@ class FastVARSelfAttention(nn.Module):
                 oup = attn_fn(q, k, v, scale=self.scale).transpose(1, 2).reshape(B, L, C)
             else:
                 q_heads, k_heads, v_heads = q, k, v
-                if flash_attn_func is not None:
-                    attn_out, entropy_scores, _ = flash_attention_entropy(
-                        q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
-                    )
+                if flash_attn_func is not None and not need_entropy:
                     q_flash = q_heads.transpose(1, 2)  # B, L, H, c
                     k_flash = k_heads.transpose(1, 2)
                     v_flash = v_heads.transpose(1, 2)
@@ -306,9 +306,9 @@ class FastVARSelfAttention(nn.Module):
                         softmax_scale=self.scale,
                     ).reshape(B, L, C)
                 else:
-                    attn_mask = attn_bias_or_two_vector
-                    # attn_out, entropy_scores = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
-                    attn_out, entropy_scores, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale)
+                    attn_out, entropy_scores, _ = flash_attention_entropy(
+                        q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
+                    )
                     oup = attn_out.transpose(1, 2).reshape(B, L, C)
 
             # oup: bf16
@@ -509,7 +509,17 @@ class FastVARCrossAttnBlock(nn.Module):
         shortcut = x
         # x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale1, shift=shift1)
         x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
-        x_sa, pruned_entropy = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind,rope_idx=idx_fn,ori_len=shortcut.shape[1])
+        x_sa, pruned_entropy = self.sa(
+            x_sa,
+            attn_bias_or_two_vector,
+            attn_fn,
+            scale_schedule,
+            rope2d_freqs_grid,
+            scale_ind=scale_ind,
+            rope_idx=idx_fn,
+            ori_len=shortcut.shape[1],
+            need_entropy=is_later_layer,
+        )
         x_sa = x_sa.mul_(gamma1)
 
         # x_sa = unmerge_fn(x_sa,self.previous_scale_cache_self_attn,self.cached_size)

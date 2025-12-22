@@ -94,7 +94,7 @@ my_config = {
     "num_train_envs": 1,
     "epoch_num": 50,
     "eval_episode_num": 5,
-    "prompt_pool_size": 100,
+    "prompt_pool_size": 1000,
     "iterations_per_prompt": 1,
 }
 
@@ -299,9 +299,9 @@ if __name__ == "__main__":
     text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
     # ------------ multi-prompt definition (name -> text) -------------
-    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_landscape_1000.json") as f:
+    # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_landscape_1000.json") as f:
 
-    # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json") as f:
         meta_data = json.load(f)
 
     prompts = {}
@@ -370,7 +370,7 @@ if __name__ == "__main__":
     infinity = load_transformer(vae, args)
 
     #### load PPO model
-    load_model = True
+    load_model = False
     trained_model_path = None
     if load_model:
 
@@ -378,7 +378,7 @@ if __name__ == "__main__":
         OBS_CHANNELS = 32 + 32 + 1  # prev codes + current codes + scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './checkpoint/best_v2_PPO3'
+        trained_model_path = './checkpoint/best_v2_reward13'
         print(f"Loading PPO Agent from {trained_model_path}...")
         # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (65, 64, 64)) 報錯
         policy_kwargs = dict(
@@ -486,14 +486,14 @@ if __name__ == "__main__":
                 num_scales = len(scale_schedule)
 
                 for si in range(num_scales):
-
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    wall_start = time.perf_counter()
                     decode_img = si == num_scales - 1
                     if load_model is not True:
                         prune_ratio = get_pruning_ratio(si, num_scales)
                     else:
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        wall_start = time.perf_counter()
+
                         if summed_codes is not None:
                             # Match VAREnv interpolation logic
                             interp_mode = getattr(
@@ -540,9 +540,7 @@ if __name__ == "__main__":
                             if prune_ratio > 0.95:
                                 prune_ratio = 1.0
 
-                        if torch.cuda.is_available():
-                            torch.cuda.synchronize()
-                        consume_time += time.perf_counter() - wall_start
+
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
                         codes, summed_codes, img, state = infinity.infer_pruned_per_scale(
                             vae=vae,
@@ -573,7 +571,9 @@ if __name__ == "__main__":
                         )
                         if load_model:
                             pre_obs = obs
-
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    consume_time += time.perf_counter() - wall_start
 
                 if img is None and isinstance(summed_codes, torch.Tensor):
                     img = vae.decode(summed_codes.squeeze(-3))
