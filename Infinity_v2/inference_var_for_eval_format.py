@@ -94,7 +94,7 @@ my_config = {
     "num_train_envs": 1,
     "epoch_num": 50,
     "eval_episode_num": 5,
-    "prompt_pool_size": 1000,
+    "prompt_pool_size": 100,
     "iterations_per_prompt": 1,
 }
 
@@ -299,15 +299,17 @@ if __name__ == "__main__":
     text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
     # ------------ multi-prompt definition (name -> text) -------------
-    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_landscape_1000.json") as f:
+
+    # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json") as f:
         meta_data = json.load(f)
 
     prompts = {}
 
     for img_id, data in meta_data.items():
-        if 'people' in data['category']:
+        # if 'people' in data['category']:
         # if 'fashion' in data['category']:
-            prompts[img_id] = data['prompt']
+        prompts[img_id] = data['prompt']
         if len(prompts) >= my_config["prompt_pool_size"]:
             break
 
@@ -368,19 +370,19 @@ if __name__ == "__main__":
     infinity = load_transformer(vae, args)
 
     #### load PPO model
-    load_model = False
+    load_model = True
+    trained_model_path = None
     if load_model:
 
         OBS_H, OBS_W = 64, 64
-        OBS_CHANNELS = 32 + 1  # 32 code channels + 1 scale channel
+        OBS_CHANNELS = 32 + 32 + 1  # prev codes + current codes + scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './checkpoint/best_PPO_v4.zip'
+        trained_model_path = './checkpoint/best_v2_PPO3'
         print(f"Loading PPO Agent from {trained_model_path}...")
-        # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (33, 64, 64)) 報錯
+        # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (65, 64, 64)) 報錯
         policy_kwargs = dict(
             features_extractor_class=FastVARCNNExtractor,
-            # features_extractor_kwargs=dict(features_dim=128, width=32),
             features_extractor_kwargs=dict(features_dim=256, width=64),
             normalize_images=False,
         )
@@ -392,6 +394,12 @@ if __name__ == "__main__":
             device='cuda',
             custom_objects=custom_objects,
         )
+
+    if trained_model_path:
+        ppo_name = os.path.splitext(os.path.basename(trained_model_path))[0]
+        ctime_filename = f"ctime_{ppo_name}.txt"
+    else:
+        ctime_filename = "consume_time.txt"
 
     cfg_value = 4
     tau_value = 0.5
@@ -405,8 +413,6 @@ if __name__ == "__main__":
     # print(scale_schedule)
 
     torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
 
     # global metadata for all prompts (optional, stored in base_output_dir)
     global_prompt_records = []
@@ -475,14 +481,19 @@ if __name__ == "__main__":
                 state = None
                 summed_codes = None
                 img = None
+                pre_obs = None
 
                 num_scales = len(scale_schedule)
 
                 for si in range(num_scales):
+
                     decode_img = si == num_scales - 1
                     if load_model is not True:
                         prune_ratio = get_pruning_ratio(si, num_scales)
                     else:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        wall_start = time.perf_counter()
                         if summed_codes is not None:
                             # Match VAREnv interpolation logic
                             interp_mode = getattr(
@@ -500,7 +511,7 @@ if __name__ == "__main__":
                             codes_resized = resized.squeeze(-3)[0].cpu().float()
                         else:
                             # First step: Empty codes
-                            codes_resized = torch.zeros(OBS_CHANNELS - 1, OBS_H, OBS_W, dtype=torch.float32)
+                            codes_resized = torch.zeros(32, OBS_H, OBS_W, dtype=torch.float32)
                         norm_scale = float(si / max(num_scales - 1, 1))
                         scale_plane = torch.full(
                             (1, OBS_H, OBS_W),
@@ -510,7 +521,11 @@ if __name__ == "__main__":
                         )
 
                         # C. Concatenate and Convert to Numpy for PPO
-                        full_obs_tensor = torch.cat([codes_resized, scale_plane], dim=0)
+                        if pre_obs is not None:
+                            prev_codes = torch.from_numpy(pre_obs[:32]).to(device=codes_resized.device, dtype=codes_resized.dtype)
+                        else:
+                            prev_codes = torch.zeros_like(codes_resized)
+                        full_obs_tensor = torch.cat([prev_codes, codes_resized, scale_plane], dim=0)
                         obs = full_obs_tensor.numpy().astype(np.float32)
                         if si < SKIP_FIRST_N_SCALES:
                             prune_ratio = 0.0
@@ -524,7 +539,10 @@ if __name__ == "__main__":
                             prune_ratio = max(0.0, min(1.0, prune_ratio))
                             if prune_ratio > 0.95:
                                 prune_ratio = 1.0
-                    start_event.record()
+
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        consume_time += time.perf_counter() - wall_start
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
                         codes, summed_codes, img, state = infinity.infer_pruned_per_scale(
                             vae=vae,
@@ -553,9 +571,9 @@ if __name__ == "__main__":
                             state=state,
                             decode_img=decode_img,
                         )
-                    end_event.record()
-                    torch.cuda.synchronize()
-                    consume_time += start_event.elapsed_time(end_event) / 1000.0
+                        if load_model:
+                            pre_obs = obs
+
 
                 if img is None and isinstance(summed_codes, torch.Tensor):
                     img = vae.decode(summed_codes.squeeze(-3))
@@ -607,7 +625,7 @@ if __name__ == "__main__":
         if isinstance(img, torch.Tensor) and img.dim() == 4 and img.shape[0] == 1:
             img = img[0]
 
-        with open("consume_time.txt", "a") as file:
+        with open(ctime_filename, "a") as file:
             file.write(f'{img_id}: {consume_time}\n')
 
         total_elapsed = time.time() - start_time_total

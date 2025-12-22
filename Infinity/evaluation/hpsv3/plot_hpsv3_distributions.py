@@ -32,6 +32,7 @@ def main() -> None:
 
     plt.style.use("ggplot")
     fig, (ax_hist, ax_violin) = plt.subplots(1, 2, figsize=(12, 5))
+    stats = {}
 
     # Overlayed histograms
     colors = {
@@ -40,18 +41,43 @@ def main() -> None:
         "Score_RL": "#d62728",
     }
     for col in score_cols:
+        series = df[col].dropna()
+        stats[col] = {"mean": series.mean()}
         ax_hist.hist(
-            df[col].dropna(),
+            series,
             bins=args.bins,
             alpha=0.5,
             label=col.replace("Score_", ""),
             color=colors[col],
             density=True,
         )
+        ax_hist.axvline(
+            stats[col]["mean"],
+            color=colors[col],
+            linestyle="--",
+            linewidth=1.5,
+            alpha=0.9,
+        )
     ax_hist.set_title("Score Distributions (Histogram)")
     ax_hist.set_xlabel("Score")
     ax_hist.set_ylabel("Density")
     ax_hist.legend()
+    # Annotate means near the top of the histogram for quick reference
+    ymax = ax_hist.get_ylim()[1]
+    for idx, col in enumerate(score_cols):
+        label = col.replace("Score_", "")
+        y_pos = ymax * (0.92 - 0.06 * idx)
+        ax_hist.text(
+            stats[col]["mean"],
+            y_pos,
+            f"{label} μ={stats[col]['mean']:.3f}",
+            color=colors[col],
+            fontsize=9,
+            ha="right",
+            va="center",
+            rotation=90,
+            backgroundcolor="white",
+        )
 
     # Violin plot for quick comparison
     data = [df[col].dropna() for col in score_cols]
@@ -60,6 +86,19 @@ def main() -> None:
     ax_violin.set_xticklabels([c.replace("Score_", "") for c in score_cols])
     ax_violin.set_title("Score Distributions (Violin)")
     ax_violin.set_ylabel("Score")
+    # Label means on top of the violin markers
+    for idx, col in enumerate(score_cols, start=1):
+        ax_violin.scatter(idx, stats[col]["mean"], color=colors[col], s=25, zorder=3)
+        ax_violin.text(
+            idx,
+            stats[col]["mean"],
+            f"{stats[col]['mean']:.3f}",
+            ha="center",
+            va="bottom",
+            fontsize=9,
+            color=colors[col],
+            backgroundcolor="white",
+        )
 
     fig.suptitle("HPSv3 Score Comparison", fontsize=14)
     fig.tight_layout()

@@ -795,6 +795,8 @@ class Infinity(nn.Module):
         save_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/results/gen_images_v3",
         # Stateful handle carried across scales; pass None on the first call.
         state: dict | None = None,
+        # Decode uint8 image; set False when you only need latent codes and will decode once at the end.
+        decode_img: bool = True,
     ):
         """
         Step-wise version of `autoregressive_infer_cfg` that runs **one scale step**
@@ -979,7 +981,7 @@ class Infinity(nn.Module):
         if scale_ind >= trunk_scale:
             # Do nothing for this and further scales.
             img = None
-            if summed_codes is not None and not isinstance(summed_codes, int):
+            if decode_img and summed_codes is not None and not isinstance(summed_codes, int):
                 img = vae.decode(summed_codes.squeeze(-3))
                 img = (img + 1) / 2
                 img = (
@@ -1049,7 +1051,7 @@ class Infinity(nn.Module):
             state["summed_codes"] = summed_codes
 
             img = None
-            if isinstance(summed_codes, torch.Tensor):
+            if decode_img and isinstance(summed_codes, torch.Tensor):
                 img = vae.decode(summed_codes.squeeze(-3))
                 img = (img + 1) / 2
                 img = (
@@ -1267,9 +1269,11 @@ class Infinity(nn.Module):
         state["summed_codes"] = summed_codes
 
         # Decode current image from summed_codes (VAE path, uint8, B x H x W x C)
-        img = vae.decode(summed_codes.squeeze(-3))
-        img = (img + 1) / 2
-        img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
+        img = None
+        if decode_img:
+            img = vae.decode(summed_codes.squeeze(-3))
+            img = (img + 1) / 2
+            img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
 
         return codes, summed_codes, img, state
 

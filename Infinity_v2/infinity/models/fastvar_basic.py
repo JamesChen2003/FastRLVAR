@@ -252,6 +252,7 @@ class FastVARSelfAttention(nn.Module):
         """
         # x: fp32
         B, L, C = x.shape
+        entropy_scores = None
         
         # qkv: amp, bf16
         qkv = F.linear(input=x, weight=self.mat_qkv.weight, bias=torch.cat((self.q_bias, self.zero_k_bias, self.v_bias))).view(B, L, 3, self.num_heads, self.head_dim)  # BL3Hc
@@ -278,6 +279,10 @@ class FastVARSelfAttention(nn.Module):
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
             else:                                   # inference (autoregressive sampling)
                 kw = dict()
+                q_heads, k_heads, v_heads = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+                attn_out, entropy_scores, _ = flash_attention_entropy(
+                    q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
+                )
             oup = flash_attn_func(q.to(v.dtype), k.to(v.dtype), v, dropout_p=0, softmax_scale=self.scale, **kw).view(B, L, C)
         else:
             # if self.cos_attn: q, k are in fp32; v is in bf16
@@ -287,7 +292,19 @@ class FastVARSelfAttention(nn.Module):
             else:
                 q_heads, k_heads, v_heads = q, k, v
                 if flash_attn_func is not None:
-                    oup = flash_attn_func(q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
+                    attn_out, entropy_scores, _ = flash_attention_entropy(
+                        q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, scale=self.scale
+                    )
+                    q_flash = q_heads.transpose(1, 2)  # B, L, H, c
+                    k_flash = k_heads.transpose(1, 2)
+                    v_flash = v_heads.transpose(1, 2)
+                    oup = flash_attn_func(
+                        q_flash.to(v_flash.dtype),
+                        k_flash.to(v_flash.dtype),
+                        v_flash,
+                        dropout_p=0,
+                        softmax_scale=self.scale,
+                    ).reshape(B, L, C)
                 else:
                     attn_mask = attn_bias_or_two_vector
                     # attn_out, entropy_scores = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
@@ -538,4 +555,3 @@ class AdaLNBeforeHead(nn.Module):
             return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
         else:
             return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
-

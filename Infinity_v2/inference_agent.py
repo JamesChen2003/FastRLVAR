@@ -266,13 +266,12 @@ if __name__ == "__main__":
     #     id=my_config["run_id"],
     #     resume="allow",
     # )
-
-    model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_2b_reg.pth'
-    vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_vae_d32reg.pth'
-    text_encoder_ckpt = 'google/flan-t5-xl'
+    model_path='/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
+    vae_path=  '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
+    text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
     # ------------ multi-prompt definition (name -> text) -------------
-    with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/meta_data.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json") as f:
         meta_data = json.load(f)
 
     prompts = {}
@@ -343,12 +342,22 @@ if __name__ == "__main__":
     if load_model:
 
         OBS_H, OBS_W = 64, 64
-        OBS_CHANNELS = 32 + 1  # 32 code channels + 1 scale channel
+        OBS_CHANNELS = 32+32 + 1  # 32 code channels + 1 scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './best_PPO5.zip'
+        trained_model_path = './checkpoint/best_v2_PPO3'
         print(f"Loading PPO Agent from {trained_model_path}...")
-        model = PPO.load(trained_model_path, device='cuda')
+        # Override the default NatureCNN with the custom extractor used in training
+        policy_kwargs = dict(
+            features_extractor_class=FastVARCNNExtractor,
+            features_extractor_kwargs=dict(features_dim=256, width=64),
+            normalize_images=False,
+        )
+        model = PPO.load(
+            trained_model_path,
+            device='cuda',
+            custom_objects={"policy_kwargs": policy_kwargs},
+        )
 
     cfg_value = 4
     tau_value = 0.5
@@ -430,6 +439,7 @@ if __name__ == "__main__":
                 state = None
                 summed_codes = None
                 img = None
+                pre_obs = None
 
                 num_scales = len(scale_schedule)
 
@@ -454,7 +464,7 @@ if __name__ == "__main__":
                             codes_resized = resized.squeeze(-3)[0].cpu().float()
                         else:
                             # First step: Empty codes
-                            codes_resized = torch.zeros(OBS_CHANNELS - 1, OBS_H, OBS_W, dtype=torch.float32)
+                            codes_resized = torch.zeros(32, OBS_H, OBS_W, dtype=torch.float32)
                         norm_scale = float(si / max(num_scales - 1, 1))
                         scale_plane = torch.full(
                             (1, OBS_H, OBS_W),
@@ -464,7 +474,11 @@ if __name__ == "__main__":
                         )
 
                         # C. Concatenate and Convert to Numpy for PPO
-                        full_obs_tensor = torch.cat([codes_resized, scale_plane], dim=0)
+                        if pre_obs is not None:
+                            prev_codes = torch.from_numpy(pre_obs[:32]).to(device=codes_resized.device, dtype=codes_resized.dtype)
+                        else:
+                            prev_codes = torch.zeros_like(codes_resized)
+                        full_obs_tensor = torch.cat([prev_codes, codes_resized, scale_plane], dim=0)
                         obs = full_obs_tensor.numpy().astype(np.float32)
                         if si < SKIP_FIRST_N_SCALES:
                             prune_ratio = 0.0
@@ -490,23 +504,24 @@ if __name__ == "__main__":
                             negative_label_B_or_BLT=negative_label_B_or_BLT,
                             g_seed=g_seed if si == 0 else None,
                             cfg_list=cfg_list,
-                            tau_list=tau_list,
-                            cfg_sc=cfg_sc,
-                            top_k=top_k,
-                            top_p=top_p,
-                            returns_vemb=1,
+                                tau_list=tau_list,
+                                cfg_sc=cfg_sc,
+                                top_k=top_k,
+                                top_p=top_p,
+                                returns_vemb=1,
                             cfg_insertion_layer=cfg_insertion_layer_,
                             vae_type=vae_type,
                             trunk_scale=1000,
                             gt_leak=gt_leak if gt_leak >= 0 else 0,
                             gt_ls_Bl=gt_ls_Bl,
                             inference_mode=True,
-                            sampling_per_bits=sampling_per_bits,
-                            save_intermediate_results=save_intermediate_results,
-                            save_dir=save_dir,
-                            state=state,
-                        )
-                    consume_time += time.time() - start_time
+                                sampling_per_bits=sampling_per_bits,
+                                save_intermediate_results=save_intermediate_results,
+                                save_dir=save_dir,
+                                state=state,
+                            )
+                        pre_obs = obs
+                        consume_time += time.time() - start_time
 
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.

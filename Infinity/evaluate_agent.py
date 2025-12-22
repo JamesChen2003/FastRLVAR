@@ -43,7 +43,7 @@ ENABLE_METRICS = {
     "lpips": True,
     
     # Quality (無需 Original，需要 Prompt)
-    "clip_score": False,
+    "clip_score": True,
     "image_reward": False,  # 需安裝 ImageReward 環境有點問題
     "viescore": False,     # 需自定義模型
     "geneval": False       # 需自定義模型
@@ -138,7 +138,12 @@ class MetricsEvaluator:
 
     def calc_psnr(self, img_true, img_test):
         # Input: Numpy arrays [H, W, C], range [0, 255]
-        return psnr_metric(img_true, img_test, data_range=255)
+        # Avoid skimage divide-by-zero warnings when images are identical.
+        diff = img_true.astype(np.float32) - img_test.astype(np.float32)
+        mse = np.mean(np.square(diff))
+        if mse <= 1e-8:
+            return 100.0
+        return 10.0 * np.log10((255.0 ** 2) / mse)
 
     def calc_ssim(self, img_true, img_test):
         # Input: Numpy arrays [H, W, C], range [0, 255]
@@ -436,9 +441,45 @@ def evaluate(args):
         df.to_csv(filename, index=False)
         print(f"Saved per-image metrics to {filename}")
 
+    def prepare_variant_df(rows, suffix):
+        if not rows:
+            return None
+        df = pd.DataFrame(rows)
+        for col in csv_columns:
+            if col not in df.columns:
+                df[col] = None
+        df = df[csv_columns]
+        rename_map = {col: f"{col}_{suffix}" for col in csv_columns if col != "id"}
+        return df.rename(columns=rename_map)
+
+    def save_combined(rows_map, filename):
+        suffix_map = {"ORIGINAL": "orig", "FAST": "fast", "RL": "rl"}
+        merged = None
+        for key in ["ORIGINAL", "FAST", "RL"]:
+            df_variant = prepare_variant_df(rows_map.get(key, []), suffix_map[key])
+            if df_variant is None:
+                continue
+            if merged is None:
+                merged = df_variant
+            else:
+                merged = merged.merge(df_variant, on="id", how="outer")
+        if merged is None:
+            print(f"No data for {filename}, skip saving.")
+            return
+        ordered_cols = ["id"]
+        for metric in metric_columns:
+            for suffix in ["orig", "fast", "rl"]:
+                col_name = f"{metric}_{suffix}"
+                if col_name in merged.columns:
+                    ordered_cols.append(col_name)
+        merged = merged[ordered_cols]
+        merged.to_csv(filename, index=False)
+        print(f"Saved combined per-image metrics to {filename}")
+
     save_csv(per_image_rows["ORIGINAL"], "orignal.csv")
     save_csv(per_image_rows["FAST"], "FastVar.csv")
     save_csv(per_image_rows["RL"], "RL.csv")
+    save_combined(per_image_rows, "per_image_metrics_combined.csv")
 
 
 if __name__ == "__main__":

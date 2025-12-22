@@ -81,13 +81,11 @@ def get_pruning_ratio(scale: int, num_scales: int) -> float:
     global image_num
     # Apply pruning only to the last few scales.
     N = min(5, num_scales)
-    tail_pattern = [
-        [0.4, 0.5, 1.0, 0.8, 1.0][:N],
-        [0.8, 0.7, 0.6, 1.0, 1.0][:N]
-        ]
-    prune_scale_list[-N:] = tail_pattern[image_num % 2]
-    if scale == num_scales - 1:
-        image_num += 1
+    # tail_pattern = [0.0, 0.4, 0.5, 1.0, 1.0][:N]
+
+    tail_pattern = [0.0, 0.0, 0.0, 0.0, 0.0][:N]
+    
+    prune_scale_list[-N:] = tail_pattern
     return prune_scale_list[scale]
 
 def gen_one_img(
@@ -247,16 +245,107 @@ def save_slim_model(infinity_model_path, save_file=None, device='cpu', key='gpt_
     print('[Save slim model] done')
     return save_file
 
-def load_tokenizer(t5_path ='', device='cuda'):
-    print(f'[Loading tokenizer and text encoder]')
-    text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(t5_path, revision=None, legacy=True)
-    text_tokenizer.model_max_length = 512
-    text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(t5_path, torch_dtype=torch.float16)
-    
-    text_encoder.to(device)
-    text_encoder.eval()
-    text_encoder.requires_grad_(False)
-    return text_tokenizer, text_encoder
+
+def _find_tokenizer_in_hf_cache(repo_like: str):
+    """
+    Try to locate a cached model dir under ~/.cache/huggingface/hub
+    Return a path (str) or None.
+    """
+    cache_root = os.path.expanduser("~/.cache/huggingface/hub")
+    if not os.path.isdir(cache_root):
+        return None
+    # normalize search token: e.g. "google/flan-t5-xl" -> "google--flan-t5-xl" or check substring
+    token = repo_like.replace("/", "--")
+    for name in os.listdir(cache_root):
+        # names look like "models--google--flan-t5-xl"
+        if token in name or repo_like in name:
+            root = os.path.join(cache_root, name)
+            # root may have subfolders (commit hashes). search for dir that has tokenizer files.
+            for sub in os.listdir(root):
+                subdir = os.path.join(root, sub)
+                if _dir_has_tokenizer_files(subdir):
+                    return subdir
+            # sometimes tokenizer files are directly under root
+            if _dir_has_tokenizer_files(root):
+                return root
+    return None
+
+def load_tokenizer(t5_path: str = ""):
+    """
+    Robust tokenizer + encoder loader.
+    Accepts:
+      - local folder path (with tokenizer files)
+      - huggingface repo id like "google/flan-t5-xl"
+      - a local folder that only contains model weights (will try cache or fallback to hub)
+    Returns: (text_tokenizer, text_encoder)
+    """
+    print(f'[Loading tokenizer and text encoder] t5_path={t5_path!r}')
+    t5_path = os.path.expanduser(str(t5_path)) if t5_path else ""
+
+    # 1) If an explicit local dir with tokenizer files -> load locally
+    if t5_path and os.path.isdir(t5_path) and _dir_has_tokenizer_files(t5_path):
+        print(f'Loading tokenizer from local folder: {t5_path}')
+        text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(
+            t5_path, local_files_only=True, revision=None, legacy=True
+        )
+        text_tokenizer.model_max_length = 512
+        print('Loading encoder from local folder (weights)...')
+        text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(
+            t5_path, torch_dtype=torch.float16, local_files_only=True
+        )
+        text_encoder.to('cuda')
+        text_encoder.eval()
+        text_encoder.requires_grad_(False)
+        return text_tokenizer, text_encoder
+
+    # 2) Try to find matching tokenizer in HF cache
+    if t5_path:
+        cached = _find_tokenizer_in_hf_cache(t5_path)
+        if cached:
+            print(f'Found tokenizer in HF cache: {cached}')
+            text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(
+                cached, local_files_only=True, revision=None, legacy=True
+            )
+            text_tokenizer.model_max_length = 512
+            # For encoder weights, attempt to load from same cached dir; if that fails,
+            # fallback to using repo id below.
+            try:
+                text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(
+                    cached, torch_dtype=torch.float16, local_files_only=True
+                )
+                text_encoder.to('cuda')
+                text_encoder.eval()
+                text_encoder.requires_grad_(False)
+                return text_tokenizer, text_encoder
+            except Exception as e:
+                print(f'Warning: loading encoder from cached dir failed: {e}. Will try repo id below.')
+
+    # 3) Fallback: try to treat t5_path as a repo id or use official id
+    # Try the provided t5_path first (may be repo id), then fallback to google/flan-t5-xl.
+    tried = []
+    for repo_candidate in filter(None, [t5_path, "google/flan-t5-xl"]):
+        try:
+            print(f'Trying AutoTokenizer.from_pretrained("{repo_candidate}") (may download)...')
+            text_tokenizer: T5TokenizerFast = AutoTokenizer.from_pretrained(
+                repo_candidate, revision=None, legacy=True
+            )
+            text_tokenizer.model_max_length = 512
+            print(f'Loaded tokenizer from {repo_candidate}')
+            print(f'Loading encoder from {repo_candidate} (this may download large files)...')
+            text_encoder: T5EncoderModel = T5EncoderModel.from_pretrained(
+                repo_candidate, torch_dtype=torch.float16
+            )
+            text_encoder.to('cuda')
+            text_encoder.eval()
+            text_encoder.requires_grad_(False)
+            return text_tokenizer, text_encoder
+        except Exception as e:
+            print(f'Failed to load from {repo_candidate!r}: {e}')
+            tried.append((repo_candidate, e))
+
+    # If we reach here, nothing worked
+    raise RuntimeError(f"Failed to load tokenizer/encoder. Tried: {tried}")
+
 
 def load_infinity(
     rope2d_each_sa_layer, 
