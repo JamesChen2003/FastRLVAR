@@ -43,7 +43,7 @@ ENABLE_METRICS = {
     "lpips": True,
     
     # Quality (無需 Original，需要 Prompt)
-    "clip_score": True,
+    "clip_score": False,
     "image_reward": False,  # 需安裝 ImageReward 環境有點問題
     "viescore": False,     # 需自定義模型
     "geneval": False       # 需自定義模型
@@ -150,14 +150,17 @@ class MetricsEvaluator:
         # win_size 設為 3 或 7，視圖片大小而定，multichannel=True
         return ssim_metric(img_true, img_test, data_range=255, channel_axis=2, win_size=3)
 
-    def calc_lpips(self, img_true_pil, img_test_pil):
-        # Input: PIL Images
+    def calc_lpips(self, img_true, img_test):
+        # Input: PIL Images or numpy arrays [H, W, C], range [0, 255]
         # LPIPS expects tensors in range [-1, 1]
         if self.lpips_fn is None: return 0.0
-        
-        t_true = lpips.im2tensor(np.array(img_true_pil)).to(self.device)
-        t_test = lpips.im2tensor(np.array(img_test_pil)).to(self.device)
-        
+
+        img_true_np = img_true if isinstance(img_true, np.ndarray) else np.array(img_true)
+        img_test_np = img_test if isinstance(img_test, np.ndarray) else np.array(img_test)
+
+        t_true = lpips.im2tensor(img_true_np).to(self.device)
+        t_test = lpips.im2tensor(img_test_np).to(self.device)
+
         with torch.no_grad():
             dist = self.lpips_fn(t_true, t_test)
         return dist.item()
@@ -281,6 +284,10 @@ def evaluate(args):
         viescore_model_path=args.viescore_model,
     )
 
+    need_quality_metrics = any(ENABLE_METRICS.get(k, False) for k in ("clip_score", "image_reward", "viescore"))
+    need_similarity_metrics = any(ENABLE_METRICS.get(k, False) for k in ("psnr", "ssim", "lpips"))
+    need_img_np = need_similarity_metrics
+
     # 依據 ENABLE_METRICS 建立 CSV 欄位
     metric_flags = [
         ("PSNR", "psnr"),
@@ -293,14 +300,19 @@ def evaluate(args):
     metric_columns = [name for name, flag in metric_flags if ENABLE_METRICS.get(flag, False)]
     csv_columns = ["id"] + metric_columns
 
-    fast_metadata = load_metadata(args.fast)
-    rl_metadata = load_metadata(args.rl)
-    orig_metadata = load_metadata(args.orig)
+    if need_quality_metrics:
+        fast_metadata = load_metadata(args.fast)
+        rl_metadata = load_metadata(args.rl) if args.rl else {}
+        orig_metadata = load_metadata(args.orig)
+    else:
+        fast_metadata = {}
+        rl_metadata = {}
+        orig_metadata = {}
     
     # 1. 讀取檔案列表
     orig_files = get_image_paths(args.orig)
     fast_files = get_image_paths(args.fast)
-    rl_files = get_image_paths(args.rl)
+    rl_files = get_image_paths(args.rl) if args.rl else []
 
     # 確保數量一致 (以 FAST 為基準，因為 Original 可能是參考用)
     print(f"Found images -> Orig: {len(orig_files)}, FAST: {len(fast_files)}, RL: {len(rl_files)}")
@@ -309,14 +321,22 @@ def evaluate(args):
     per_image_rows = {
         "ORIGINAL": [],
         "FAST": [],
-        "RL": []
     }
+    if args.rl:
+        per_image_rows["RL"] = []
 
     def init_row(file_id):
         row = {"id": file_id}
         for col in metric_columns:
             row[col] = None
         return row
+
+    def load_image(path):
+        if not path or not os.path.exists(path):
+            return None, None
+        img = Image.open(path).convert("RGB")
+        img_np = np.array(img) if need_img_np else None
+        return (img if need_quality_metrics else None), img_np
 
     # 以 FAST 資料夾的檔案名稱為主 key
     for idx, fast_path in enumerate(tqdm(fast_files, desc="Evaluating Images")):
@@ -325,27 +345,23 @@ def evaluate(args):
         
         # 尋找對應的 Orig 和 RL 檔案
         orig_path = os.path.join(args.orig, filename)
-        rl_path = os.path.join(args.rl, filename)
+        rl_path = os.path.join(args.rl, filename) if args.rl else None
 
-        if not os.path.exists(orig_path):
-            # print(f"Warning: Original missing for {filename}, skipping similarity metrics.")
-            orig_img = None
-        else:
-            orig_img = Image.open(orig_path).convert("RGB")
-            orig_np = np.array(orig_img)
+        orig_img, orig_np = (None, None)
+        if need_similarity_metrics or need_quality_metrics:
+            orig_img, orig_np = load_image(orig_path)
 
-        if not os.path.exists(rl_path):
-            rl_img = None
-        else:
-            rl_img = Image.open(rl_path).convert("RGB")
+        rl_img, rl_np = (None, None)
+        if rl_path:
+            rl_img, rl_np = load_image(rl_path)
 
-        fast_img = Image.open(fast_path).convert("RGB")
-        fast_prompt = get_prompt_from_filename(fast_path, fast_metadata)
-        rl_prompt = get_prompt_from_filename(rl_path, rl_metadata) if rl_img is not None else None
-        orig_prompt = get_prompt_from_filename(orig_path, orig_metadata) if orig_img is not None else None
+        fast_img, fast_np = load_image(fast_path)
+        fast_prompt = get_prompt_from_filename(fast_path, fast_metadata) if need_quality_metrics else None
+        rl_prompt = get_prompt_from_filename(rl_path, rl_metadata) if (need_quality_metrics and rl_img is not None) else None
+        orig_prompt = get_prompt_from_filename(orig_path, orig_metadata) if (need_quality_metrics and orig_img is not None) else None
 
         # Original 圖片的品質指標
-        if orig_img is not None:
+        if orig_img is not None and need_quality_metrics:
             orig_row = init_row(file_id)
             if ENABLE_METRICS["clip_score"]:
                 orig_row["CLIP"] = evaluator.calc_clip_score(orig_img, orig_prompt)
@@ -357,19 +373,18 @@ def evaluate(args):
         
         # 定義要測試的目標 (Target) 與 對照組 (Reference)
         # 我們要測試 FAST 和 RL
-        targets = [
-            ("FAST", fast_img, fast_prompt),
-            ("RL", rl_img, rl_prompt)
-        ]
+        targets = [("FAST", fast_img, fast_prompt, fast_np)]
+        if args.rl:
+            targets.append(("RL", rl_img, rl_prompt, rl_np))
 
-        for name, img, prompt in targets:
-            if img is None: continue
-            
-            img_np = np.array(img)
+        for name, img, prompt, img_np in targets:
+            if img is None and img_np is None:
+                continue
+
             row = init_row(file_id)
 
             # --- Similarity Metrics (Requires Original) ---
-            if orig_img is not None:
+            if orig_np is not None:
                 if ENABLE_METRICS["psnr"] and psnr_metric:
                     row["PSNR"] = evaluator.calc_psnr(orig_np, img_np)
                 
@@ -377,7 +392,7 @@ def evaluate(args):
                     row["SSIM"] = evaluator.calc_ssim(orig_np, img_np)
                 
                 if ENABLE_METRICS["lpips"]:
-                    row["LPIPS"] = evaluator.calc_lpips(orig_img, img)
+                    row["LPIPS"] = evaluator.calc_lpips(orig_np, img_np)
 
             # --- Quality Metrics (No Original Needed) ---
             if ENABLE_METRICS["clip_score"]:
@@ -400,7 +415,7 @@ def evaluate(args):
 
     final_data = {}
     for model_name in ["FAST", "RL", "ORIGINAL"]:
-        rows = per_image_rows[model_name]
+        rows = per_image_rows.get(model_name, [])
         if not rows:
             continue
         df_model = pd.DataFrame(rows)
@@ -453,9 +468,11 @@ def evaluate(args):
         return df.rename(columns=rename_map)
 
     def save_combined(rows_map, filename):
-        suffix_map = {"ORIGINAL": "orig", "FAST": "fast", "RL": "rl"}
+        suffix_map = {"ORIGINAL": "orig", "FAST": "fast"}
+        if "RL" in rows_map:
+            suffix_map["RL"] = "rl"
         merged = None
-        for key in ["ORIGINAL", "FAST", "RL"]:
+        for key in suffix_map.keys():
             df_variant = prepare_variant_df(rows_map.get(key, []), suffix_map[key])
             if df_variant is None:
                 continue
@@ -468,7 +485,7 @@ def evaluate(args):
             return
         ordered_cols = ["id"]
         for metric in metric_columns:
-            for suffix in ["orig", "fast", "rl"]:
+            for suffix in suffix_map.values():
                 col_name = f"{metric}_{suffix}"
                 if col_name in merged.columns:
                     ordered_cols.append(col_name)
@@ -478,23 +495,43 @@ def evaluate(args):
 
     save_csv(per_image_rows["ORIGINAL"], "orignal.csv")
     save_csv(per_image_rows["FAST"], "FastVar.csv")
-    save_csv(per_image_rows["RL"], "RL.csv")
+    if "RL" in per_image_rows:
+        save_csv(per_image_rows["RL"], "RL.csv")
     save_combined(per_image_rows, "per_image_metrics_combined.csv")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate VAR Model Results (Original vs FAST vs RL)")
     
-    parser.add_argument("--orig", type=str, required=True, help="Folder path for Original (Unpruned) images")
-    parser.add_argument("--fast", type=str, required=True, help="Folder path for FAST (Pruned) images")
-    parser.add_argument("--rl", type=str, required=True, help="Folder path for RL images")
+    parser.add_argument(
+        "--orig",
+        "--original",
+        "--origianl",
+        "--o",
+        dest="orig",
+        type=str,
+        required=True,
+        help="Folder path for Original (Unpruned) images",
+    )
+    parser.add_argument(
+        "--fast",
+        "--fastvar",
+        "--f",
+        dest="fast",
+        type=str,
+        required=True,
+        help="Folder path for FAST (Pruned) images",
+    )
+    parser.add_argument("--rl", "--RL", dest="rl", type=str, default=None, help="Folder path for RL images (optional)")
     parser.add_argument("--reward-model", type=str, default=None, help="Path or HF repo for ImageReward model (default: zai-org/ImageReward)")
     parser.add_argument("--viescore-model", type=str, default=None, help="Path or HF repo for VIEScore model (default: TIGER-Lab/VIEScore)")
     
     args = parser.parse_args()
     
     # Check folders
-    if not os.path.exists(args.orig) or not os.path.exists(args.fast) or not os.path.exists(args.rl):
+    if not os.path.exists(args.orig) or not os.path.exists(args.fast):
         print("Error: One or more input directories do not exist.")
+    elif args.rl and not os.path.exists(args.rl):
+        print("Error: RL input directory does not exist.")
     else:
         evaluate(args)

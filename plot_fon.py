@@ -1,73 +1,126 @@
 import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
+from matplotlib.ticker import FuncFormatter, MaxNLocator
 
-original_time = 2.168098
-data = {
-    'Method': ['Original', 'FastVar', 'Our (Fast)', 'Our (Quality)'],
-    'Time (s)': [2.168098, 0.814935, 0.642997+ 0.009, 0.683150+ 0.009],
-    'HPSV3': [10.750, 10.071, 10.154, 10.278],
-    'Group': ['Baseline', 'Competitor', 'Ours', 'Ours']
-}
+# ---- Data ----
+baseline_time = 1.566  # Infinity time
 
-df = pd.DataFrame(data)
-df['Speedup'] = original_time / df['Time (s)']
+rows = [
+    {"Method": "Infinity", "Time (s)": 1.566,   "Quality": 10.750, "Group": "Baseline"},
+    {"Method": "FastVAR", "Time (s)": 0.649,    "Quality": 9.951,  "Group": "Competitor"},
+    {"Method": "FastVAR†", "Time (s)": 0.698,  "Quality": 10.071, "Group": "Competitor"},
+    {"Method": "ATP-VAR α=0.75", "Time (s)": 0.65158, "Quality": 10.350, "Group": "Ours"},
+    {"Method": "ATP-VAR α=0.9",  "Time (s)": 0.6133,  "Quality": 10.150, "Group": "Ours"},
+]
 
-sns.set_theme(style="whitegrid")
-plt.figure(figsize=(10, 6))
+df = pd.DataFrame(rows)
+df["Speedup"] = baseline_time / df["Time (s)"]
 
-colors = {'Baseline': 'gray', 'Competitor': 'blue', 'Ours': '#d62728'}
+plt.rcParams.update({
+    "font.size": 12,
+    "axes.titlesize": 15,
+    "axes.labelsize": 13,
+    "legend.fontsize": 11,
+})
+
+fig, ax = plt.subplots(figsize=(10, 6))
+
+# default-cycle colors per group (no manual colors)
+groups = list(df['Group'].unique())
+group_to_color = {}
+for g in groups:
+    group_to_color[g] = ax._get_lines.get_next_color()
+
 markers = {'Baseline': 'o', 'Competitor': 's', 'Ours': 'D'}
 
-for group in df['Group'].unique():
-    subset = df[df['Group'] == group]
-    plt.scatter(subset['Speedup'], subset['HPSV3'],
-                label=group,
-                color=colors[group],
-                marker=markers[group],
-                s=150, edgecolors='k', zorder=5)
+for g in groups:
+    sub = df[df["Group"] == g]
+    ax.scatter(
+        sub["Speedup"], sub["Quality"],
+        s=180, alpha=0.95,
+        marker=markers.get(g, "o"),
+        edgecolors="white", linewidths=1.2,
+        label=g, zorder=5, color=group_to_color[g]
+    )
 
-for i, row in df.iterrows():
-    xytext = (5, 5)
-    ha = 'left'
-    va = 'bottom'
+# ---- Labels ----
+for _, row in df.iterrows():
+    label = (
+        f"{row['Method']}\n"
+        f"Speedup: {row['Speedup']:.2f}×\n"
+        f"Quality: {row['Quality']:.3f}"
+    )
+    xytext = (10, 10)
+    ha, va = "left", "bottom"
 
-    if row['Method'] == 'FastVar':
-        xytext = (0, -25)
-        ha = 'center'
-    elif row['Method'] == 'Our (Fast)':
-        xytext = (-5, 12)
-        ha = 'center'
-    elif row['Method'] == 'Our (Quality)':
-        xytext = (5, 5)
-    elif row['Method'] == 'Original':
-        xytext = (-10, -20)
-        ha = 'right'
+    if row["Method"] == "Infinity":
+        xytext = (10, -35)
+        ha, va = "left", "top"
+    elif row["Method"] == "ATP-VAR α=0.75":
+        xytext = (10, 28)   # up
+    elif row["Method"] == "ATP-VAR α=0.9":
+        xytext = (10, 20)  # down to avoid overlap
+        ha, va = "left", "top"
+    elif row["Method"] == "FastVAR":
+        xytext = (-110, 0)
+        ha, va = "left", "top"
+    elif row["Method"] == "FastVAR†":
+        xytext = (-120, 20)
+        ha, va = "left", "top"
+    ax.annotate(
+        label,
+        (row["Speedup"], row["Quality"]),
+        textcoords="offset points",
+        xytext=xytext,
+        ha=ha, va=va,
+        bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="none", alpha=0.85),
+        zorder=10
+    )
 
-    plt.annotate(row['Method'],
-                 (row['Speedup'], row['HPSV3']),
-                 xytext=xytext, textcoords='offset points',
-                 fontsize=12, fontweight='bold', ha=ha, va=va)
+# ---- Pareto frontier (requested explicit path) ----
+frontier_order = ["Infinity", "ATP-VAR α=0.75", "ATP-VAR α=0.9"]
+frontier_df = df.set_index("Method").loc[frontier_order].reset_index()
+ax.plot(
+    frontier_df["Speedup"], frontier_df["Quality"],
+    linestyle="-", linewidth=2, alpha=0.85,color="black",
+    label="Pareto Frontier", zorder=3
+)
 
-frontier_methods = ['Original', 'Our (Quality)', 'Our (Fast)']
-frontier_df = df[df['Method'].isin(frontier_methods)].sort_values('Speedup')
+# Arrow along the same path (Infinity -> α=0.75 -> α=0.9)
+for a, b in zip(frontier_order[:-1], frontier_order[1:]):
+    ra = df[df["Method"] == a].iloc[0]
+    rb = df[df["Method"] == b].iloc[0]
+    ax.annotate(
+        "",
+        xy=(rb["Speedup"], rb["Quality"]),
+        xytext=(ra["Speedup"], ra["Quality"]),
+        arrowprops=dict(arrowstyle="-", lw=2,alpha=0.85),
+        zorder=4
+    )
 
-plt.plot(frontier_df['Speedup'], frontier_df['HPSV3'],
-         color='#d62728', linestyle='--', alpha=0.6, linewidth=2, label='Pareto Frontier')
+# ---- Axes: padding + ticks ----
+xmin, xmax = df["Speedup"].min(), df["Speedup"].max()
+ymin, ymax = df["Quality"].min(), df["Quality"].max()
 
-fastvar = df[df['Method'] == 'FastVar'].iloc[0]
-our_fast = df[df['Method'] == 'Our (Fast)'].iloc[0]
-our_quality = df[df['Method'] == 'Our (Quality)'].iloc[0]
-plt.annotate("",
-             xy=(our_quality['Speedup'], our_quality['HPSV3']),
-             xytext=(fastvar['Speedup'], fastvar['HPSV3']),
-             arrowprops=dict(arrowstyle="->", color="green", lw=2, ls='-'))
-plt.xlabel('Speedup vs Original (x) [Higher is Better]', fontsize=13)
-plt.ylabel('HPSV3 Score [Higher is Better]', fontsize=13)
-plt.title('Performance Comparison: Speedup vs Quality', fontsize=15, fontweight='bold', y=1.02)
+xpad = (xmax - xmin) * 0.22 if xmax > xmin else 0.3
+ypad = (ymax - ymin) * 0.30 if ymax > ymin else 0.2
 
-plt.grid(True, linestyle='--', alpha=0.7)
-plt.legend(loc='lower left', fontsize=11, frameon=True, framealpha=0.9)
+ax.set_xlim(xmin - xpad, xmax + xpad)
+ax.set_ylim(ymin - ypad, ymax + ypad)
 
-plt.tight_layout()
-plt.savefig('pareto_frontier_clean.png', dpi=300)
+ax.xaxis.set_major_locator(MaxNLocator(nbins=6))
+ax.xaxis.set_major_formatter(FuncFormatter(lambda x, pos: f"{x:.1f}×"))
+ax.yaxis.set_major_locator(MaxNLocator(nbins=7))
+ax.yaxis.set_major_formatter(FuncFormatter(lambda y, pos: f"{y:.2f}"))
+
+ax.set_xlabel("Speedup (×)  [Higher is Better]")
+ax.set_ylabel("Quality (HPSV3)  [Higher is Better]")
+ax.set_title("Performance Comparison: Speedup vs Quality")
+
+ax.grid(True, linestyle="--", alpha=0.35)
+ax.legend(loc="lower left", frameon=True, framealpha=0.95)
+
+fig.tight_layout()
+
+out_path = "pareto_frontier_newdata_v3_frontier.png"
+fig.savefig(out_path, dpi=300)

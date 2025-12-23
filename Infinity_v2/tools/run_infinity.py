@@ -81,9 +81,9 @@ def get_pruning_ratio(scale: int, num_scales: int) -> float:
     global image_num
     # Apply pruning only to the last few scales.
     N = min(5, num_scales)
-    tail_pattern = [0.0, 0.4, 0.5, 1.0, 1.0][:N]
+    # tail_pattern = [0.0, 0.4, 0.5, 1.0, 1.0][:N]
 
-    # tail_pattern = [0.0, 0.0, 0.0, 0.0, 0.0][:N]
+    tail_pattern = [0.0, 0.0, 0.0, 0.0, 0.0][:N]
     
     prune_scale_list[-N:] = tail_pattern
     return prune_scale_list[scale]
@@ -389,7 +389,7 @@ def load_infinity(
             prune_scale_list=default_prune_cfg,
             **model_kwargs,
         ).to(device=device)
-        print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
+        # print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
 
         if bf16:
             for block in infinity_test.unregistered_blocks:

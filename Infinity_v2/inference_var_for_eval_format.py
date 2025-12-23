@@ -283,6 +283,15 @@ def save_used_metadata(run_dir: str, used_metadata: dict):
         json.dump(used_metadata, f, ensure_ascii=False, indent=4)
     print(f"Wrote metadata for generated prompts to {os.path.abspath(meta_output_path)}")
 
+def save_prune_ratios(run_dir: str, prune_ratios: dict):
+    """
+    Save a prune_ratio_last4.json describing last-4 pruning ratios per image id.
+    """
+    output_path = os.path.join(run_dir, "prune_ratio_last4.json")
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(prune_ratios, f, ensure_ascii=False, indent=4)
+    print(f"Wrote prune ratios to {os.path.abspath(output_path)}")
+
 if __name__ == "__main__":
     # Create wandb session
     # run = wandb.init(
@@ -299,7 +308,7 @@ if __name__ == "__main__":
     text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
 
     # ------------ multi-prompt definition (name -> text) -------------
-    # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_landscape_1000.json") as f:
+    # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/report.json") as f:
 
     with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json") as f:
         meta_data = json.load(f)
@@ -370,7 +379,7 @@ if __name__ == "__main__":
     infinity = load_transformer(vae, args)
 
     #### load PPO model
-    load_model = False
+    load_model = True
     trained_model_path = None
     if load_model:
 
@@ -378,7 +387,7 @@ if __name__ == "__main__":
         OBS_CHANNELS = 32 + 32 + 1  # prev codes + current codes + scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './checkpoint/best_v2_reward13'
+        trained_model_path = './checkpoint/best_v2_PPO3'
         print(f"Loading PPO Agent from {trained_model_path}...")
         # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (65, 64, 64)) 報錯
         policy_kwargs = dict(
@@ -404,7 +413,8 @@ if __name__ == "__main__":
     cfg_value = 4
     tau_value = 0.5
     h_div_w = 1 / 1  # aspect ratio, height:width
-    seed = 0
+
+    #TODO 改回 seed = 0
     enable_positive_prompt = 0
 
     h_div_w_template_ = h_div_w_templates[np.argmin(np.abs(h_div_w_templates - h_div_w))]
@@ -439,13 +449,15 @@ if __name__ == "__main__":
     gt_leak=0
     gt_ls_Bl=None
     g_seed=0
+    #改回來
     sampling_per_bits=1
     enable_positive_prompt=0
-    save_intermediate_results=False
+    save_intermediate_results=True
     save_dir=None
     per_scale_infer=True
 
     used_metadata = {}
+    prune_ratio_records = {}
 
     for image_num, (img_id, prompt) in enumerate(prompt_items):
         start_time_total = time.time()
@@ -485,6 +497,7 @@ if __name__ == "__main__":
 
                 num_scales = len(scale_schedule)
 
+                per_image_prune_ratios = []
                 for si in range(num_scales):
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
@@ -541,6 +554,7 @@ if __name__ == "__main__":
                                 prune_ratio = 1.0
 
 
+                    per_image_prune_ratios.append(float(prune_ratio))
                     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
                         codes, summed_codes, img, state = infinity.infer_pruned_per_scale(
                             vae=vae,
@@ -583,6 +597,7 @@ if __name__ == "__main__":
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.
                 reset_prune_print_cache()
+                prune_ratio_records[img_id] = per_image_prune_ratios[-4:]
 
                 # `img` is already the decoded uint8 image for the final scale.
                 img_list = [img]
@@ -642,6 +657,9 @@ if __name__ == "__main__":
             used_metadata[img_id] = meta_data[img_id]
         else:
             used_metadata[img_id] = {"prompt": prompt}
+        if img_id in prune_ratio_records:
+            used_metadata[img_id]["prune_ratio_last4"] = prune_ratio_records[img_id]
 
     # Save metadata for all generated images in this run
     save_used_metadata(run_output_dir, used_metadata)
+    save_prune_ratios(run_output_dir, prune_ratio_records)

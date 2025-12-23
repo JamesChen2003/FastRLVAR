@@ -457,7 +457,7 @@ class Infinity(nn.Module):
             if flash_attn_has_code:
                 file_path = inspect.getsourcefile(flash_attn_func)
                 line_number = inspect.getsourcelines(flash_attn_func)[1]
-                varnames_info = f'>>>>>> {flash_attn_func.__code__.co_varnames=} <<<<<<\n'
+                # varnames_info = f'>>>>>> {flash_attn_func.__code__.co_varnames=} <<<<<<\n'
             else:
                 file_path = 'N/A'
                 line_number = 'N/A'
@@ -588,7 +588,7 @@ class Infinity(nn.Module):
         
         self.num_block_chunks = block_chunks or 1
         self.num_blocks_in_a_chunk = depth // block_chunks
-        print(f"{self.num_blocks_in_a_chunk=}, {depth=}, {block_chunks=}")
+        # print(f"{self.num_blocks_in_a_chunk=}, {depth=}, {block_chunks=}")
         assert self.num_blocks_in_a_chunk * block_chunks == depth
         if self.num_block_chunks == 1:
             self.blocks = nn.ModuleList(self.unregistered_blocks)
@@ -792,7 +792,7 @@ class Infinity(nn.Module):
         inference_mode: bool = False,
         sampling_per_bits: int = 1,
         save_intermediate_results: bool = False,
-        save_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/results/gen_images_v3",
+        save_dir: str = "/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/results/run50",
         # Stateful handle carried across scales; pass None on the first call.
         state: dict | None = None,
         # Decode uint8 image; set False when you only need latent codes and will decode once at the end.
