@@ -55,8 +55,10 @@ mkdir -p Infinity/checkpoint
 curl -L https://huggingface.co/FoundationVision/Infinity/resolve/main/infinity_vae_d32.pth \
   -o Infinity/checkpoint/infinity_vae_d32.pth
 
+### Dataset
+only use meat_data.json don't need to download
 
-## Training (Infinity_v2/train.py)
+### Training (Infinity_v2/train.py)
 
 ```bash
 python Infinity_v2/train.py
