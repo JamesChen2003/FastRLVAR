@@ -29,7 +29,7 @@ fairscale==0.4.13
 Farama-Notifications==0.0.4
 filelock==3.19.1
 fire==0.7.1
-flash_attn @ file:///nfs/home/tensore/pip_wheels/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl#sha256=425b1068cf5b8c916d09cc4ee21c9a102d9b3f83851cf8555cb8aa89265a52df
+# flash_attn @ file:///nfs/home/tensore/pip_wheels/flash_attn-2.8.3%2Bcu12torch2.7cxx11abiFALSE-cp312-cp312-linux_x86_64.whl#sha256=425b1068cf5b8c916d09cc4ee21c9a102d9b3f83851cf8555cb8aa89265a52df
 fonttools==4.60.1
 frozenlist==1.8.0
 fsspec==2025.9.0

@@ -310,7 +310,7 @@ if __name__ == "__main__":
     # ------------ multi-prompt definition (name -> text) -------------
     # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/report.json") as f:
 
-    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/results/ppov4/meta_data.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data.json") as f:
         meta_data = json.load(f)
 
     prompts = {}
@@ -452,7 +452,7 @@ if __name__ == "__main__":
     #改回來
     sampling_per_bits=1
     enable_positive_prompt=0
-    save_intermediate_results=True
+    save_intermediate_results=False
     save_dir=None
     per_scale_infer=True
 

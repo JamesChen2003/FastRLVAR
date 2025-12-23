@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 ```bash
 conda env create -f environment.yml
-conda activate fastvar
+conda activate eval_env
 ```
 
 ### FlashAttention (important)
@@ -30,6 +30,31 @@ Example:
 ```bash
 pip install /path/to/flash_attn-*.whl
 ```
+
+## Checkpoints
+
+### Download T5 (text encoder)
+
+Run the helper script to fetch `google/flan-t5-xl` into your Hugging Face cache:
+
+```bash
+python Infinity/checkpoint/download_t5.py
+```
+
+### Download Infinity checkpoint
+
+```bash
+mkdir -p Infinity/checkpoint
+curl -L https://huggingface.co/FoundationVision/Infinity/resolve/main/infinity_2b_reg.pth \
+  -o Infinity/checkpoint/infinity_2b_reg.pth
+```
+### Download VAE checkpoint
+
+```bash
+mkdir -p Infinity/checkpoint
+curl -L https://huggingface.co/FoundationVision/Infinity/resolve/main/infinity_vae_d32.pth \
+  -o Infinity/checkpoint/infinity_vae_d32.pth
+
 
 ## Training (Infinity_v2/train.py)
 
@@ -47,7 +72,6 @@ This script has no CLI arguments. Configure these in `Infinity_v2/train.py`:
 - `my_config["save_path"]`: model output path
 - `my_config["epoch_num"]`: number of epochs
 - `my_config["prompt_pool_size"]`: prompt pool size
-- `pruning_scales`: prune ratios (string format, e.g. `"64:1.0"`)
 
 Note: this script initializes W&B by default (login required).
 
@@ -62,9 +86,8 @@ This script has no CLI arguments. Configure these in `Infinity_v2/inference_var_
 - `model_path`: path to the Infinity checkpoint
 - `vae_path`: path to the VAE checkpoint
 - `text_encoder_ckpt`: T5 checkpoint path (or HF cache dir)
-- metadata load path: JSON file used to build prompts (default `Infinity_v2/report.json`)
+- metadata load path: JSON file used to build prompts (default `Infinity_v2/meta_data.json` class people total 1000 testcase )
 - `my_config["prompt_pool_size"]`: number of prompts to run
-- `pruning_scales`: prune ratios (string format, e.g. `"32:0.4,40:0.5,48:1.0,64:1.0"`)
 - `load_model`: whether to load a PPO agent (True/False)
 - `trained_model_path`: PPO checkpoint path (when `load_model` is True)
 
@@ -78,6 +101,7 @@ python Infinity_v2/eval_hpsv3.py \
   --fastvar /path/to/fastvar \
   --RL /path/to/RL
 ```
+--f --o also accepted
 
 Arguments:
 
