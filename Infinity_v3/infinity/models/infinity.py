@@ -791,6 +791,9 @@ class Infinity(nn.Module):
         gt_ls_Bl=None,
         inference_mode: bool = False,
         sampling_per_bits: int = 1,
+        skip_last_cfg: bool = False,
+        debug_bs: bool = False,
+        ret_img: bool = True,
         save_intermediate_results: bool = False,
         save_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/results/gen_images_v3",
         # Stateful handle carried across scales; pass None on the first call.
@@ -905,6 +908,16 @@ class Infinity(nn.Module):
                             else module.attn
                         ).kv_caching(True)
 
+            # IMPORTANT: reset FastVAR pruning caches per new generation run.
+            # These caches persist on the module and can carry a stale batch size
+            # (e.g., after dropping CFG from 2B->B on previous runs), which will
+            # crash `unmerge()` on the next prompt.
+            for b in self.unregistered_blocks:
+                if isinstance(b, FastVARCrossAttnBlock):
+                    b.previous_scale_cache_self_attn = None
+                    b.previous_scale_cache_cross_attn = None
+                    b.previous_scale_cache_ffn = None
+
             abs_cfg_insertion_layers = []
             add_cfg_on_logits, add_cfg_on_probs = False, False
             leng = len(self.unregistered_blocks)
@@ -968,6 +981,8 @@ class Infinity(nn.Module):
             add_cfg_on_probs = state["add_cfg_on_probs"]
             num_stages_minus_1 = state["num_stages_minus_1"]
             summed_codes = state["summed_codes"]
+            # Lazily initialized flag to allow shrinking the CFG batch.
+            state.setdefault("cfg_dropped", False)
 
         # ------------------------------------------------------------------ #
         # 2) One-scale body (equivalent to a single iteration of the loop in
@@ -979,7 +994,7 @@ class Infinity(nn.Module):
         if scale_ind >= trunk_scale:
             # Do nothing for this and further scales.
             img = None
-            if summed_codes is not None and not isinstance(summed_codes, int):
+            if ret_img and summed_codes is not None and not isinstance(summed_codes, int):
                 img = vae.decode(summed_codes.squeeze(-3))
                 img = (img + 1) / 2
                 img = (
@@ -1049,7 +1064,7 @@ class Infinity(nn.Module):
             state["summed_codes"] = summed_codes
 
             img = None
-            if isinstance(summed_codes, torch.Tensor):
+            if ret_img and isinstance(summed_codes, torch.Tensor):
                 img = vae.decode(summed_codes.squeeze(-3))
                 img = (img + 1) / 2
                 img = (
@@ -1071,6 +1086,58 @@ class Infinity(nn.Module):
                 b.prune_scale_list = self.prune_scale_list
 
         cfg = cfg_list[scale_ind]
+
+        # Optionally disable CFG on the last N scales. We can also drop the
+        # uncond half of the batch (2B -> B) to reduce compute/memory on the
+        # biggest scales.
+        skip_last_n_scales = 2
+        if skip_last_cfg and scale_ind >= (len(scale_schedule) - skip_last_n_scales):
+            cfg = 1.0
+            if bs == 2 * B and not state.get("cfg_dropped", False):
+                # Shrink batch + slice caches to keep only the conditioned stream.
+                last_stage = last_stage[:B]
+                cond_BD = cond_BD[:B]
+                cond_BD_or_gss = cond_BD_or_gss[:B]
+
+                kv_compact, cu_seqlens_k, max_seqlen_k = ca_kv
+                cu_seqlens_k = cu_seqlens_k[: B + 1]
+                n_tok = int(cu_seqlens_k[-1].item())
+                kv_compact = kv_compact[:n_tok]
+                ca_kv = (kv_compact, cu_seqlens_k, max_seqlen_k)
+
+                # Slice per-block KV caches (self-attn) and any auxiliary caches.
+                for blk in self.unregistered_blocks:
+                    attn = blk.sa if isinstance(blk, FastVARCrossAttnBlock) else blk.attn
+                    if getattr(attn, "cached_k", None) is not None:
+                        attn.cached_k = attn.cached_k[:B]
+                    if getattr(attn, "cached_v", None) is not None:
+                        attn.cached_v = attn.cached_v[:B]
+                    # fastvar pruning cache tensors
+                    for cache_name in (
+                        "previous_scale_cache_self_attn",
+                        "previous_scale_cache_cross_attn",
+                        "previous_scale_cache_ffn",
+                    ):
+                        cache_val = getattr(blk, cache_name, None)
+                        if isinstance(cache_val, torch.Tensor) and cache_val.shape[0] >= B:
+                            setattr(blk, cache_name, cache_val[:B])
+
+                bs = B
+                state["cfg_dropped"] = True
+                state["bs"] = bs
+                state["ca_kv"] = ca_kv
+                state["cond_BD"] = cond_BD
+                state["cond_BD_or_gss"] = cond_BD_or_gss
+                state["last_stage"] = last_stage
+
+        # Debug: print effective batch size right before running the transformer blocks.
+        # Enable via: INFINITY_DEBUG_BS=1
+        if debug_bs or os.environ.get("INFINITY_DEBUG_BS", "0") == "1":
+            print(
+                f"[debug_bs] infer_pruned_per_scale scale={pn[1]}x{pn[2]} "
+                f"scale_ind={scale_ind} cfg_eff={cfg} B={B} bs={int(last_stage.shape[0])} "
+                f"cfg_dropped={state.get('cfg_dropped', False)}"
+            )
         cur_L += np.array(pn).prod()
 
         need_to_pad = 0
@@ -1266,10 +1333,15 @@ class Infinity(nn.Module):
         state["idx_Bld_list"] = idx_Bld_list
         state["summed_codes"] = summed_codes
 
-        # Decode current image from summed_codes (VAE path, uint8, B x H x W x C)
-        img = vae.decode(summed_codes.squeeze(-3))
-        img = (img + 1) / 2
-        img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
+        # Decode current image from summed_codes (VAE path, uint8, B x H x W x C).
+        # NOTE: decoding is expensive; during per-scale inference we often only
+        # need the final image, so callers can pass ret_img=False for intermediate
+        # scales to reduce peak memory usage.
+        img = None
+        if ret_img:
+            img = vae.decode(summed_codes.squeeze(-3))
+            img = (img + 1) / 2
+            img = img.permute(0, 2, 3, 1).mul_(255).to(torch.uint8).flip(dims=(3,))
 
         return codes, summed_codes, img, state
 
@@ -1289,6 +1361,7 @@ class Infinity(nn.Module):
         inference_mode=False,
         save_img_path=None,
         sampling_per_bits=1,
+        skip_last_cfg=False,
         save_intermediate_results=True,
         save_dir="/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/results/gen_images_v3",
     ):   # returns List[idx_Bl]
@@ -1341,6 +1414,13 @@ class Infinity(nn.Module):
             for block_chunk_ in self.block_chunks:
                 for module in block_chunk_.module.module:
                     (module.sa if isinstance(module, FastVARCrossAttnBlock) else module.attn).kv_caching(True)
+
+        # IMPORTANT: reset FastVAR pruning caches per new generation run.
+        for b in self.unregistered_blocks:
+            if isinstance(b, FastVARCrossAttnBlock):
+                b.previous_scale_cache_self_attn = None
+                b.previous_scale_cache_cross_attn = None
+                b.previous_scale_cache_ffn = None
         
         abs_cfg_insertion_layers = []
         add_cfg_on_logits, add_cfg_on_probs = False, False
@@ -1359,6 +1439,52 @@ class Infinity(nn.Module):
 
         num_stages_minus_1 = len(scale_schedule)-1
         summed_codes = 0
+        cfg_dropped = False
+        skip_last_n_scales = 2
+
+        def _drop_uncond_batch_if_needed(si: int):
+            """
+            If CFG duplicated the batch (2B) for earlier scales and we skip CFG
+            on the last two scales, we can drop the uncond half before the heavy
+            forward passes to reduce compute/memory.
+            """
+            nonlocal bs, ca_kv, cond_BD, cond_BD_or_gss, last_stage, cfg_dropped
+            if cfg_dropped:
+                return
+            if not skip_last_cfg:
+                return
+            if si < (len(scale_schedule) - skip_last_n_scales):
+                return
+            if bs != 2 * B:
+                return
+
+            last_stage = last_stage[:B]
+            cond_BD = cond_BD[:B]
+            cond_BD_or_gss = cond_BD_or_gss[:B]
+
+            kv_compact_local, cu_seqlens_k_local, max_seqlen_k_local = ca_kv
+            cu_seqlens_k_local = cu_seqlens_k_local[: B + 1]
+            n_tok = int(cu_seqlens_k_local[-1].item())
+            kv_compact_local = kv_compact_local[:n_tok]
+            ca_kv = (kv_compact_local, cu_seqlens_k_local, max_seqlen_k_local)
+
+            for blk in self.unregistered_blocks:
+                attn = blk.sa if isinstance(blk, FastVARCrossAttnBlock) else blk.attn
+                if getattr(attn, "cached_k", None) is not None:
+                    attn.cached_k = attn.cached_k[:B]
+                if getattr(attn, "cached_v", None) is not None:
+                    attn.cached_v = attn.cached_v[:B]
+                for cache_name in (
+                    "previous_scale_cache_self_attn",
+                    "previous_scale_cache_cross_attn",
+                    "previous_scale_cache_ffn",
+                ):
+                    cache_val = getattr(blk, cache_name, None)
+                    if isinstance(cache_val, torch.Tensor) and cache_val.shape[0] >= B:
+                        setattr(blk, cache_name, cache_val[:B])
+
+            bs = B
+            cfg_dropped = True
 
         for si, pn in enumerate(scale_schedule): # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
             prune_ratio = None
@@ -1374,6 +1500,10 @@ class Infinity(nn.Module):
                 continue
  
             cfg = cfg_list[si]
+            # Optionally disable CFG on the last N scales: use the conditioned
+            # path outputs directly (no cfg mixing on hidden states/logits).
+            if skip_last_cfg and si >= (len(scale_schedule) - skip_last_n_scales):
+                cfg = 1.0
             if si >= trunk_scale:
                 break
             cur_L += np.array(pn).prod()
@@ -1382,6 +1512,17 @@ class Infinity(nn.Module):
             attn_fn = None
             if self.use_flex_attn:
                 attn_fn = self.attn_fn_compile_dict.get(tuple(scale_schedule[:(si+1)]), None)
+
+            # If we're skipping CFG on the last N scales, shrink the batch from
+            # 2B to B right before the expensive forwards.
+            _drop_uncond_batch_if_needed(si)
+
+            if os.environ.get("INFINITY_DEBUG_BS", "0") == "1":
+                print(
+                    f"[debug_bs] autoregressive_infer_cfg scale={pn[1]}x{pn[2]} "
+                    f"si={si} cfg_eff={cfg} B={B} bs={int(last_stage.shape[0])} "
+                    f"cfg_dropped={cfg_dropped}"
+                )
 
             # Uncomment these lines to benchmark inference time speedup at different scales:
             # torch.cuda.synchronize()

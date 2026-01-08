@@ -9,8 +9,8 @@ from contextlib import contextmanager
 import gc
 import argparse
 
-model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_2b_reg.pth'
-vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_vae_d32reg.pth'
+model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_2b_reg.pth'
+vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_vae_d32reg.pth'
 text_encoder_ckpt = 'google/flan-t5-xl'
 
 # ------------ multi-prompt definition (name -> text) -------------
@@ -21,28 +21,32 @@ text_encoder_ckpt = 'google/flan-t5-xl'
 #     # "woman":     "An anime-style portrait of a woman.",
 #     # "man":       "A detailed photo-realistic image of a man."
 # }
-with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/meta_data.json") as f:
+
+with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/evaluation/MJHQ30K/meta_data.json") as f:
     meta_data = json.load(f)
 
 batch_size = 2
+skip_last_cfg = True
+debug_bs = False
+num_prompts = 100
 prompts = {}
 
 for img_id, data in meta_data.items():
     if 'people' in data['category']:
         prompts[img_id] = data['prompt']
-    if len(prompts) >= 5:
+    if len(prompts) >= num_prompts:
         break
 
 # Base results dir; each prompt gets its own subfolder
-base_output_dir = "results"
+base_output_dir = "results_batched"
 os.makedirs(base_output_dir, exist_ok=True)
 
 # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64] 13 scales
 # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-pruning_scales = "48:1.0,64:1.0"
-# pruning_scales = "64:1.0"
+# pruning_scales = "32:0.1,40:0.1,48:0.2,64:1.0"
+pruning_scales = "48:0.0,64:0.0"
 
 
 def parse_pruning_scales(spec: str):
@@ -58,8 +62,7 @@ def parse_pruning_scales(spec: str):
     return result or None
 
 
-# parsed_prune_scales = parse_pruning_scales(pruning_scales)
-parsed_prune_scales = None
+parsed_prune_scales = parse_pruning_scales(pruning_scales)
 
 args = argparse.Namespace(
     pn='1M',  # 1M, 0.60M, 0.25M, 0.06M
@@ -153,10 +156,12 @@ with torch.inference_mode():
                     cfg_insertion_layer=[args.cfg_insertion_layer],
                     vae_type=args.vae_type,
                     sampling_per_bits=args.sampling_per_bits,
+                    skip_last_cfg=skip_last_cfg,
+                    debug_bs=debug_bs,
                     enable_positive_prompt=enable_positive_prompt,
                     save_intermediate_results=False,
                     save_dir=root_output_dir,   # <<< all intermediate images & fourier here
-                    per_scale_infer=True,
+                    per_scale_infer=True
                 )
 
                 # save main generated image as 1.jpg in that folder
@@ -187,13 +192,71 @@ with torch.inference_mode():
                 # add to global list
                 global_prompt_records.append(prompt_record)
         else:
-            img_list = batch_gen_img(
-                infinity,
-                vae,
-                text_tokenizer,
-                text_encoder,
-                prompts,
-            )
+            # Batched inference: chunk prompts into batches of size `batch_size`.
+            prompt_items = list(prompts.items())  # [(name, prompt_text), ...]
+            for b_start in range(0, len(prompt_items), batch_size):
+                batch_items = prompt_items[b_start : b_start + batch_size]
+                batch_names = [n for (n, _) in batch_items]
+                batch_texts = [t for (_, t) in batch_items]
+
+                print(f"\n=== Generating batch {b_start // batch_size + 1} (B={len(batch_texts)}) ===")
+                start_event.record()
+
+                # NOTE: Infinity uses a single RNG per generation call, so all
+                # samples in the batch share the same seed stream. Prompts still
+                # differ, so outputs differ, but you won't get per-sample seeds.
+                batch_images = batch_gen_img(
+                    infinity,
+                    vae,
+                    text_tokenizer,
+                    text_encoder,
+                    batch_texts,
+                    B=len(batch_texts),
+                    g_seed=seed + b_start,
+                    gt_leak=0,
+                    gt_ls_Bl=None,
+                    cfg_list=[cfg_value] * len(scale_schedule),
+                    tau_list=[tau_value] * len(scale_schedule),
+                    scale_schedule=scale_schedule,
+                    cfg_insertion_layer=[args.cfg_insertion_layer],
+                    vae_type=args.vae_type,
+                    sampling_per_bits=args.sampling_per_bits,
+                    skip_last_cfg=skip_last_cfg,
+                    debug_bs=debug_bs,
+                    enable_positive_prompt=enable_positive_prompt,
+                    save_intermediate_results=False,
+                    save_dir=base_output_dir,
+                    per_scale_infer=True,
+                )
+
+                # Save each image and metadata just like the single-image path.
+                for name, prompt_text, generated_image in zip(batch_names, batch_texts, batch_images):
+                    root_output_dir = os.path.join(base_output_dir, f"gen_images_{name}")
+                    os.makedirs(root_output_dir, exist_ok=True)
+                    metadata_path = os.path.join(root_output_dir, "config.json")
+
+                    img_path = os.path.join(root_output_dir, "1.jpg")
+                    cv2.imwrite(img_path, generated_image.cpu().numpy())
+                    print(f"Saved image for '{name}' to {os.path.abspath(img_path)}")
+
+                    prompt_record = {
+                        "prompt_name": name,
+                        "prompt": prompt_text,
+                        "image_path": img_path,
+                        "image_number": 1,
+                    }
+                    with open(metadata_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            {
+                                "pruning_scales": parsed_prune_scales or {},
+                                "pruning_scales_raw": pruning_scales,
+                                "prompt": prompt_record,
+                            },
+                            f,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                    global_prompt_records.append(prompt_record)
 
 # # optional global config across all prompts
 # global_metadata_path = os.path.join(base_output_dir, "config_all.json")

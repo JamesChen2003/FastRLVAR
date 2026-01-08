@@ -58,6 +58,55 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
     text_cond_tuple = (kv_compact, lens, cu_seqlens_k, Ltext)
     return text_cond_tuple
 
+
+def encode_prompts(text_tokenizer, text_encoder, prompts, enable_positive_prompt: bool = False):
+    """
+    Batched version of `encode_prompt`.
+
+    Args:
+        prompts: list/tuple of prompt strings (batch dimension).
+    Returns:
+        (kv_compact, lens, cu_seqlens_k, Ltext) suitable for Infinity forward/infer.
+    """
+    if not isinstance(prompts, (list, tuple)):
+        raise TypeError(f"`prompts` must be a list/tuple of strings, got {type(prompts)}")
+    if len(prompts) == 0:
+        raise ValueError("`prompts` must be non-empty")
+
+    captions = []
+    for p in prompts:
+        if not isinstance(p, str):
+            raise TypeError(f"each prompt must be a string, got {type(p)}")
+        if enable_positive_prompt:
+            p = aug_with_positive_prompt(p)
+        captions.append(p)
+
+    # Avoid extremely verbose prints for large batches.
+    if len(captions) <= 4:
+        print(f"prompts={captions}")
+    else:
+        print(f"prompts[0:4]={captions[:4]} ... (B={len(captions)})")
+
+    tokens = text_tokenizer(
+        text=captions,
+        max_length=512,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    input_ids = tokens.input_ids.cuda(non_blocking=True)
+    mask = tokens.attention_mask.cuda(non_blocking=True)
+    text_features = text_encoder(input_ids=input_ids, attention_mask=mask)["last_hidden_state"].float()
+    lens: List[int] = mask.sum(dim=-1).tolist()
+    cu_seqlens_k = F.pad(mask.sum(dim=-1).to(dtype=torch.int32).cumsum_(0), (1, 0))
+    Ltext = max(lens)
+
+    kv_compact = []
+    for len_i, feat_i in zip(lens, text_features.unbind(0)):
+        kv_compact.append(feat_i[:len_i])
+    kv_compact = torch.cat(kv_compact, dim=0)
+    return (kv_compact, lens, cu_seqlens_k, Ltext)
+
 def aug_with_positive_prompt(prompt):
     for key in ['man', 'woman', 'men', 'women', 'boy', 'girl', 'child', 'person', 'human', 'adult', 'teenager', 'employee',
                 'employer', 'worker', 'mother', 'father', 'sister', 'brother', 'grandmother', 'grandfather', 'son', 'daughter']:
@@ -112,6 +161,9 @@ def gen_one_img(
     gt_ls_Bl=None,
     g_seed=None,
     sampling_per_bits=1,
+    skip_last_cfg: bool = False,
+    prune_ratio_fn=None,
+    debug_bs: bool = False,
     enable_positive_prompt=0,
     save_intermediate_results=False,
     save_dir=None,
@@ -153,7 +205,10 @@ def gen_one_img(
             num_scales = len(scale_schedule)
 
             for si in range(num_scales):
-                prune_ratio = get_pruning_ratio(si, num_scales)
+                # By default, let the model fall back to its configured
+                # `self.prune_scale_list`. If you want a custom per-scale
+                # controller (e.g. RL), pass `prune_ratio_fn`.
+                prune_ratio = prune_ratio_fn(si, num_scales) if callable(prune_ratio_fn) else None
 
                 codes, summed_codes, img, state = infinity_test.infer_pruned_per_scale(
                     vae=vae,
@@ -177,6 +232,9 @@ def gen_one_img(
                     gt_ls_Bl=gt_ls_Bl,
                     inference_mode=True,
                     sampling_per_bits=sampling_per_bits,
+                    skip_last_cfg=skip_last_cfg,
+                    debug_bs=debug_bs,
+                    ret_img=(save_intermediate_results or (si == num_scales - 1)),
                     save_intermediate_results=save_intermediate_results,
                     save_dir=save_dir,
                     state=state,
@@ -217,6 +275,7 @@ def gen_one_img(
                 gt_ls_Bl=gt_ls_Bl,
                 inference_mode=True,
                 sampling_per_bits=sampling_per_bits,
+                skip_last_cfg=skip_last_cfg,
                 save_intermediate_results=save_intermediate_results,
                 save_dir=save_dir,
             )
@@ -252,11 +311,142 @@ def batch_gen_img(
     gt_ls_Bl=None,
     g_seed=None,
     sampling_per_bits=1,
+    skip_last_cfg: bool = False,
+    prune_ratio_fn=None,
+    debug_bs: bool = False,
     enable_positive_prompt=0,
     save_intermediate_results=False,
     save_dir=None,
     per_scale_infer=False,
 ):
+    # Normalize prompts input.
+    if isinstance(prompts, dict):
+        # Preserve insertion order (py3.7+).
+        prompts_list = list(prompts.values())
+    elif isinstance(prompts, (list, tuple)):
+        prompts_list = list(prompts)
+    else:
+        raise TypeError(f"`prompts` must be dict/list/tuple, got {type(prompts)}")
+
+    if B is None or B <= 0:
+        B = len(prompts_list)
+    if B != len(prompts_list):
+        raise ValueError(f"B={B} but got {len(prompts_list)} prompts")
+
+    if scale_schedule is None:
+        raise ValueError("`scale_schedule` must be provided")
+
+    if not isinstance(cfg_list, list):
+        cfg_list = [cfg_list] * len(scale_schedule)
+    if not isinstance(tau_list, list):
+        tau_list = [tau_list] * len(scale_schedule)
+
+    text_cond_tuple = encode_prompts(
+        text_tokenizer, text_encoder, prompts_list, enable_positive_prompt=enable_positive_prompt
+    )
+
+    if negative_prompt:
+        # Same negative prompt for each element in the batch.
+        negative_prompts = [negative_prompt] * B
+        negative_label_B_or_BLT = encode_prompts(
+            text_tokenizer, text_encoder, negative_prompts, enable_positive_prompt=False
+        )
+    else:
+        negative_label_B_or_BLT = None
+
+    with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+        if per_scale_infer:
+            if vae_type == 0 or not getattr(infinity_test, "use_bit_label", True):
+                raise NotImplementedError(
+                    "per_scale_infer=True is currently supported only for vae_type != 0 "
+                    "and use_bit_label == True."
+                )
+
+            # Ensure cfg_insertion_layer is a list, as expected by the model.
+            if not isinstance(cfg_insertion_layer, (list, tuple)):
+                cfg_insertion_layer_ = [cfg_insertion_layer]
+            else:
+                cfg_insertion_layer_ = list(cfg_insertion_layer)
+
+            state = None
+            summed_codes = None
+            img = None
+
+            num_scales = len(scale_schedule)
+            for si in range(num_scales):
+                prune_ratio = prune_ratio_fn(si, num_scales) if callable(prune_ratio_fn) else None
+                _, summed_codes, img, state = infinity_test.infer_pruned_per_scale(
+                    vae=vae,
+                    scale_schedule=scale_schedule,
+                    label_B_or_BLT=text_cond_tuple,
+                    scale_ind=si,
+                    prune_ratio=prune_ratio,
+                    B=B,
+                    negative_label_B_or_BLT=negative_label_B_or_BLT,
+                    g_seed=g_seed if si == 0 else None,
+                    cfg_list=cfg_list,
+                    tau_list=tau_list,
+                    cfg_sc=cfg_sc,
+                    top_k=top_k,
+                    top_p=top_p,
+                    returns_vemb=1,
+                    cfg_insertion_layer=cfg_insertion_layer_,
+                    vae_type=vae_type,
+                    trunk_scale=1000,
+                    gt_leak=gt_leak if gt_leak >= 0 else 0,
+                    gt_ls_Bl=gt_ls_Bl,
+                    inference_mode=True,
+                    sampling_per_bits=sampling_per_bits,
+                    skip_last_cfg=skip_last_cfg,
+                    debug_bs=debug_bs,
+                    ret_img=(save_intermediate_results or (si == num_scales - 1)),
+                    save_intermediate_results=save_intermediate_results,
+                    save_dir=save_dir,
+                    state=state,
+                )
+
+            reset_prune_print_cache()
+            img_list = [img]  # batched [B, H, W, C]
+        else:
+            _, _, img_list = infinity_test.autoregressive_infer_cfg(
+                vae=vae,
+                scale_schedule=scale_schedule,
+                label_B_or_BLT=text_cond_tuple,
+                g_seed=g_seed,
+                B=B,
+                negative_label_B_or_BLT=negative_label_B_or_BLT,
+                force_gt_Bhw=None,
+                cfg_sc=cfg_sc,
+                cfg_list=cfg_list,
+                tau_list=tau_list,
+                top_k=top_k,
+                top_p=top_p,
+                returns_vemb=1,
+                ratio_Bl1=None,
+                gumbel=gumbel,
+                norm_cfg=False,
+                cfg_exp_k=cfg_exp_k,
+                cfg_insertion_layer=cfg_insertion_layer,
+                vae_type=vae_type,
+                softmax_merge_topk=softmax_merge_topk,
+                ret_img=True,
+                trunk_scale=1000,
+                gt_leak=gt_leak,
+                gt_ls_Bl=gt_ls_Bl,
+                inference_mode=True,
+                sampling_per_bits=sampling_per_bits,
+                skip_last_cfg=skip_last_cfg,
+                save_intermediate_results=save_intermediate_results,
+                save_dir=save_dir,
+            )
+
+    # `img_list[0]` is a batched tensor [B, H, W, C] (uint8). Return a python
+    # list of per-sample images [H, W, C] for convenience.
+    if not img_list:
+        return []
+    batched = img_list[0]
+    if isinstance(batched, torch.Tensor) and batched.dim() == 4 and batched.shape[0] == B:
+        return [batched[i] for i in range(B)]
     return img_list
 
 def get_prompt_id(prompt):
