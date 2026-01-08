@@ -1,207 +1,117 @@
-<p align="center">
-    <img src="assets/logo.jpg" width="700">
-</p>
+# FastRLVAR
 
-<div align="center">
-**2K resolution image generation with on single 3090 GPU** 🏔️
-<img src="assets/teaser.jpg" style="border-radius: 15px">
+This README focuses on installation and the three main workflows: training, inference, and evaluation.
 
-<h2>
-FastVAR: Linear Visual Autoregressive Modeling via Cached Token Pruning (ICCV25)
-</h2>
+## Installation
 
-[Hang Guo](https://csguoh.github.io/), [Yawei Li](https://yaweili.bitbucket.io/), [Taolin Zhang](https://github.com/taolinzhang),  [Jiangshan Wang](https://scholar.google.com.hk/citations?user=HoKoCv0AAAAJ&hl=zh-CN&oi=ao), [Tao Dai](https://scholar.google.com.hk/citations?user=MqJNdaAAAAAJ&hl=zh-CN&oi=ao), [Shu-Tao Xia](https://scholar.google.com.hk/citations?hl=zh-CN&user=koAXTXgAAAAJ), [Luca Benini](https://ee.ethz.ch/the-department/people-a-z/person-detail.luca-benini.html)
+Choose one:
 
-![visitors](https://visitor-badge.laobi.icu/badge?page_id=cshguo.FastVAR)
-[![arXiv](https://img.shields.io/badge/arXiv-2503.23367-b31b1b.svg)](https://arxiv.org/pdf/2503.23367)
-[![Homepage](https://img.shields.io/badge/Project-Page-orange)](https://fastvar.github.io/)
+### Use requirements.txt
 
-
-</div>
-
-> **Abstract:**  Visual Autoregressive (VAR) modeling has gained popularity for its shift towards next-scale prediction. However, existing VAR paradigms process the entire token map at each scale step, leading to the complexity and runtime scaling dramatically with image resolution. To address this challenge, we propose FastVAR, a post-training acceleration method for efficient resolution scaling with VARs. Our key finding is that the majority of latency arises from the large-scale step where most tokens have already converged. Leveraging this observation, we develop the cached token pruning strategy that only forwards pivotal tokens for scalespecific modeling while using cached tokens from previous scale steps to restore the pruned slots. This significantly reduces the number of forwarded tokens and improves the efficiency at larger resolutions. Experiments show the proposed FastVAR can further speedup FlashAttentionaccelerated VAR by 2.7× with negligible performance drop of <1%. We further extend FastVAR to zero-shot generation of higher resolution images. In particular, FastVAR can generate one 2K image with 15GB memory footprints in 1.5s on a single NVIDIA 3090 GPU. 
-
-
-
-⭐If this work is helpful for you, please help star this repo. Thanks!🤗
-
-## ✨ Highlights
-
-
-1️⃣ **Faster VAR Generation without Perceptual Loss** 
-
-<p align="center">
-    <img src="assets/visual.jpg" style="border-radius: 15px">
-</p>
-
-2️⃣ **High-resolution Image Generation (even 2K image on single 3090 GPU)**
-
-<p align="center">
-    <img src="assets/high_resolution.jpg" style="border-radius: 15px">
-</p>
-
-
-3️⃣ **Promising Resolution Scalibility (almost linear complexity)** 
-
-<p align="center">
-    <img src="assets/efficiency.jpg" width="600" style="border-radius: 15px">
-</p>
-
-
-## 📑 Contents
-
-- [News](#news)
-- [Pipeline](#pipeline)
-- [TODO](#todo)
-- [Results](#results)
-- [Citation](#cite)
-
-## <a name="news"></a> 🆕 News
-
-- **2025-03-30:** arXiv paper available.
-- **2025-04-04:** This repo is released.
-- **2025-06-26:** Congrats! Our FastVAR has been accepted by ICCV2025 😊
-- **2025-06-29:** We have open sourced all our code.
-
-## <a name="todo"></a> ☑️ TODO
-
-- [x] arXiv version available 
-- [x] Release code
-- [ ] Further improvements
-
-
-## <a name="pipeline"></a> 👀 Pipeline
-
-Our FastVAR introduces the **"cached token pruning"** which works on the large-scale steps of the VAR models, which is **training-free** and **generic** for various VAR backbones.
-
-<p align="center">
-    <img src="assets/pipeline.jpg" style="border-radius: 15px">
-</p>
-
-
-## <a name="results"></a> 🥇 Results
-
-Our FastVAR can achieve **2.7x** speedup with **<1%** performance drop, even on top of [Flash-attention](https://arxiv.org/abs/2205.14135) accelerated setups. 
-
-Detailed results can be found in the paper.
-
-<details>
-<summary>Quantitative Results on the GenEval benchmark(click to expand)</summary>
-
-<p align="center">
-  <img width="900" src="assets/results.jpg">
-</p>
-</details>
-
-
-<details>
-<summary>Quantitative Results on the MJHQ30K benchmark (click to expand)</summary>
-
-<p align="center">
-  <img width="500" src="assets/results2.jpg">
-</p>
-</details>
-
-
-<details>
-<summary>Comparison and combination with FlashAttention (click to expand)</summary>
-
-<p align="center">
-  <img width="500" src="assets/flash_attn.jpg">
-</p>
-</details>
-
-
-
-## 🎈Core Algorithm
-
-For learning purpose, we provide the core algorithm of our FastVAR as follows (one may find the complete code in [this line](https://github.com/csguoh/FastVAR/blob/34411a21c4f6f4b39bc55487944c21fff85806a4/Infinity/infinity/models/fastvar_utils.py#L12)). Since our FastVAR is a general technology, other VAR-based models also potentially apply.
-
-```
-def masked_previous_scale_cache(cur_x, num_remain, cur_shape):
-    B, L, c = cur_x.shape
-    mean_x = cur_x.view(B, cur_shape[1], cur_shape[2], -1).permute(0, 3, 1, 2)
-    mean_x = torch.nn.functional.adaptive_avg_pool2d(mean_x,(1,1)).permute(0, 2, 3, 1).view(B, 1,c)
-    mse_difference = torch.sum((cur_x - mean_x)**2,dim=-1,keepdim=True)
-    select_indices = torch.argsort(mse_difference,dim=1,descending=True)
-    filted_select_indices=select_indices[:,:num_remain,:]
-
-    def merge(merged_cur_x):
-        return torch.gather(merged_cur_x,dim=1,index=filted_select_indices.repeat(1,1,c))
-
-    def unmerge(unmerged_cur_x, unmerged_cache_x, cached_hw=None):
-        unmerged_cache_x_ = unmerged_cache_x.view(B, cached_hw[0], cached_hw[1], -1).permute(0, 3, 1, 2)
-        unmerged_cache_x_ = torch.nn.functional.interpolate(unmerged_cache_x_, size=(cur_shape[1], cur_shape[2]), mode='area').permute(0, 2, 3, 1).view(B, L, c)
-        unmerged_cache_x_.scatter_(dim=1,index=filted_select_indices.repeat(1,1,c),src=unmerged_cur_x)
-        return unmerged_cache_x_
-
-    def get_src_tgt_idx():
-        return filted_select_indices
-
-    return merge, unmerge, get_src_tgt_idx
+```bash
+pip install -r requirements.txt
 ```
 
+### Use environment.yml
 
-
-## 💪Get Started
-
-We apply our FastVAR on two Text-to-Image VAR models, i.e., [Infinity](https://github.com/FoundationVision/Infinity) and [HART](https://github.com/mit-han-lab/hart). The code for the two models can be found in respective folders. For conda environment and related pre-trained LLM/VLM models, we suggest users to refer to the setup in original [Infinity](https://github.com/FoundationVision/Infinity) and [HART](https://github.com/mit-han-lab/hart) repos. In practice, we find both codebase can be compatible to the other. 
-
-### 1. FastVAR for Infinity Acceleration
-
-First cd into the Infinity folder
-
-```
-cd ./Infinity
+```bash
+conda env create -f environment.yml
+conda activate eval_env
 ```
 
-Then you can adjust pre-trained Infinity backbone weights and then run text-to-image inference to generate a single image using given user text prompts via
+### FlashAttention (important)
 
-```
-python inference.py
-```
+Install `flash-attention` by downloading the wheel that matches your CUDA / PyTorch versions from:
 
-If you additionally want to reproduce the reported results in our paper, like GenEval, MJHQ30K, HPSv2.1, and image reward, you may refer to the detailed instruction in [this file](https://github.com/csguoh/FastVAR/blob/main/Infinity/evaluation/README.md), which contains all necessary command to run respective experiments.
+https://github.com/Dao-AILab/flash-attention/releases
 
-### 2. FastVAR for HART Acceleration
+Example:
 
-First cd into the HART folder
-
-```
-cd ./HART
+```bash
+pip install /path/to/flash_attn-*.whl
 ```
 
-Then you can run text-to-image generation with the following command.
+## Checkpoints
 
-```
-python inference.py --model_path /path/to/model \
-   --text_model_path /path/to/Qwen2 \
-   --prompt "YOUR_PROMPT" \
-   --sample_folder_dir /path/to/save_dir
-```
+### Download T5 (text encoder)
 
-For evaluating HART on common benchmarks, please refer to [this file](https://github.com/csguoh/FastVAR/blob/main/HART/evaluation/README.md), which is basicly similar to Infinity model.
+Run the helper script to fetch `google/flan-t5-xl` into your Hugging Face cache:
 
-
-
-## <a name="cite"></a> 🥰 Citation
-
-Please cite us if our work is useful for your research.
-
-```
-@article{guo2025fastvar,
-  title={FastVAR: Linear Visual Autoregressive Modeling via Cached Token Pruning},
-  author={Guo, Hang and Li, Yawei and Zhang, Taolin and Wang, Jiangshan and Dai, Tao and Xia, Shu-Tao and Benini, Luca},
-  journal={arXiv preprint arXiv:2503.23367},
-  year={2025}
-}
+```bash
+python Infinity/checkpoint/download_t5.py
 ```
 
-## License
+### Download Infinity checkpoint
 
-Since this work based on the pre-trained VAR models, users should follow the license of the corresponding backbone models like [HART(MIT License)](https://github.com/mit-han-lab/hart) and [Infinity(MIT License)](https://github.com/FoundationVision/Infinity?tab=readme-ov-file). 
+```bash
+mkdir -p Infinity/checkpoint
+curl -L https://huggingface.co/FoundationVision/Infinity/resolve/main/infinity_2b_reg.pth \
+  -o Infinity/checkpoint/infinity_2b_reg.pth
+```
+### Download VAE checkpoint
 
+```bash
+mkdir -p Infinity/checkpoint
+curl -L https://huggingface.co/FoundationVision/Infinity/resolve/main/infinity_vae_d32.pth \
+  -o Infinity/checkpoint/infinity_vae_d32.pth
 
-## Contact
+### Dataset
+only use meat_data.json don't need to download
 
-If you have any questions during your reproduce, feel free to approach me at cshguo@gmail.com
+### Training (Infinity_v2/train.py)
+
+```bash
+python Infinity_v2/train.py
+```
+
+This script has no CLI arguments. Configure these in `Infinity_v2/train.py`:
+
+- `model_path`: path to the Infinity checkpoint
+- `vae_path`: path to the VAE checkpoint
+- `text_encoder_ckpt`: T5 checkpoint path (or HF cache dir)
+- metadata load path: JSON file used to build the prompt pool
+- `my_config["run_id"]`: W&B run name
+- `my_config["save_path"]`: model output path
+- `my_config["epoch_num"]`: number of epochs
+- `my_config["prompt_pool_size"]`: prompt pool size
+
+Note: this script initializes W&B by default (login required).
+
+## Inference (Infinity_v2/inference_var_for_eval_format.py)
+
+```bash
+python Infinity_v2/inference_var_for_eval_format.py
+```
+
+This script has no CLI arguments. Configure these in `Infinity_v2/inference_var_for_eval_format.py`:
+
+- `model_path`: path to the Infinity checkpoint
+- `vae_path`: path to the VAE checkpoint
+- `text_encoder_ckpt`: T5 checkpoint path (or HF cache dir)
+- metadata load path: JSON file used to build prompts (default `Infinity_v2/meta_data.json` class people total 1000 testcase )
+- `my_config["prompt_pool_size"]`: number of prompts to run
+- `load_model`: whether to load a PPO agent (True/False)
+- `trained_model_path`: PPO checkpoint path (when `load_model` is True)
+
+Outputs are written under `results/` in an auto-incremented subfolder.
+
+## Evaluation (Infinity_v2/eval_hpsv3.py)
+
+```bash
+python Infinity_v2/eval_hpsv3.py \
+  --original /path/to/original \
+  --fastvar /path/to/fastvar \
+  --RL /path/to/RL
+```
+--f --o also accepted
+
+Arguments:
+
+- `--original` (required): folder with original images and `meta_data.json`
+- `--fastvar` (optional): folder with FastVAR outputs
+- `--RL` (optional): folder with RL outputs
+
+Notes:
+
+- CUDA GPU is required for HPSv3 inference
+- Results are saved to `hpsv3_comparison_results.csv`
