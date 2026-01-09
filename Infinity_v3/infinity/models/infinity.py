@@ -38,6 +38,7 @@ from infinity.models.basic import (
     precompute_rope2d_freqs_grid,
 )
 from infinity.models.fastvar_basic import FastVARCrossAttnBlock
+from infinity.models.fastvar_utils import reset_prune_print_cache
 
 from infinity.utils import misc
 from infinity.models.flex_attn import FlexAttn
@@ -404,6 +405,7 @@ class Infinity(nn.Module):
         apply_spatial_patchify = 0,
         inference_mode=False,
         prune_scale_list=None,
+        start_entropy_scale=24,
     ):
         # set hyperparameters
         self.C = embed_dim
@@ -574,6 +576,7 @@ class Infinity(nn.Module):
                 checkpointing_sa_only=self.checkpointing == 'self-attn',
                 use_flex_attn=use_flex_attn, batch_size=batch_size, pad_to_multiplier=pad_to_multiplier, rope2d_normalized_by_hw=rope2d_normalized_by_hw,
                 prune_scale_list=self.prune_scale_list,
+                start_entropy_scale=start_entropy_scale,
             )
             self.unregistered_blocks.append(block)
         
@@ -799,6 +802,7 @@ class Infinity(nn.Module):
         # Stateful handle carried across scales; pass None on the first call.
         state: dict | None = None,
     ):
+        from infinity.models.fastvar_basic import FastVARCrossAttnBlock
         """
         Step-wise version of `autoregressive_infer_cfg` that runs **one scale step**
         and returns `(codes, summed_codes, img, state)`.
@@ -835,6 +839,11 @@ class Infinity(nn.Module):
         if state is None:
             if scale_ind != 0:
                 raise ValueError("state must be None only for scale_ind == 0")
+
+            # Reset shared anchor entropy caches
+            FastVARCrossAttnBlock.anchor_entropy_current_scale = None
+            FastVARCrossAttnBlock.last_scale_ind = -1
+            reset_prune_print_cache()
 
             # RNG
             if g_seed is None:
@@ -1365,6 +1374,7 @@ class Infinity(nn.Module):
         save_intermediate_results=True,
         save_dir="/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/results/gen_images_v3",
     ):   # returns List[idx_Bl]
+        from infinity.models.fastvar_basic import FastVARCrossAttnBlock
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
         assert len(cfg_list) >= len(scale_schedule)
@@ -1416,6 +1426,10 @@ class Infinity(nn.Module):
                     (module.sa if isinstance(module, FastVARCrossAttnBlock) else module.attn).kv_caching(True)
 
         # IMPORTANT: reset FastVAR pruning caches per new generation run.
+        FastVARCrossAttnBlock.anchor_entropy_current_scale = None
+        FastVARCrossAttnBlock.last_scale_ind = -1
+        reset_prune_print_cache()
+
         for b in self.unregistered_blocks:
             if isinstance(b, FastVARCrossAttnBlock):
                 b.previous_scale_cache_self_attn = None
@@ -1497,6 +1511,19 @@ class Infinity(nn.Module):
                         f"[{pn[1]}x{pn[2]}] Pruning ratio = {prune_ratio * 100:.0f}%, Remaining Tokens: 0/{total_tokens} (skipping stage)"
                     )
                     self._prune_skip_logged.add(pn[2])
+                
+                # Still need to prepare last_stage for the next scale
+                if si != num_stages_minus_1:
+                    if isinstance(summed_codes, torch.Tensor):
+                        # Use current summed_codes to produce last_stage for si+1
+                        last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up)
+                        last_stage = last_stage.squeeze(-3)
+                        if self.apply_spatial_patchify:
+                            last_stage = torch.nn.functional.pixel_unshuffle(last_stage, 2)
+                        last_stage = last_stage.reshape(*last_stage.shape[:2], -1)
+                        last_stage = torch.permute(last_stage, [0,2,1])
+                        last_stage = self.word_embed(self.norm0_ve(last_stage))
+                        last_stage = last_stage.repeat(bs//B, 1, 1)
                 continue
  
             cfg = cfg_list[si]

@@ -8,28 +8,26 @@ from tools.run_infinity import *
 from contextlib import contextmanager
 import gc
 import argparse
+from infinity.utils.plot_pruned_tokens import set_pruned_output_dir, reset_pruned_data, finalize_pruned_tokens, plot_pruned_tokens
 
 model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_2b_reg.pth'
 vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_vae_d32reg.pth'
 text_encoder_ckpt = 'google/flan-t5-xl'
 
-# ------------ multi-prompt definition (name -> text) -------------
-# prompts = {
-#     # "cat":       "A cute cat on the grass.",
-#     "city":      "A futuristic city skyline at night.",
-#     "astronaut": "An astronaut painting on the moon.",
-#     # "woman":     "An anime-style portrait of a woman.",
-#     # "man":       "A detailed photo-realistic image of a man."
-# }
-
 with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/evaluation/MJHQ30K/meta_data.json") as f:
     meta_data = json.load(f)
 
-batch_size = 2
+#############################
+#        settings              
+#############################
+batch_size = 1
 skip_last_cfg = True
 debug_bs = False
-num_prompts = 100
+num_prompts = 20
+per_scale_infer = False
 prompts = {}
+base_output_dir = "results_anchor"
+os.makedirs(base_output_dir, exist_ok=True)
 
 for img_id, data in meta_data.items():
     if 'people' in data['category']:
@@ -37,17 +35,15 @@ for img_id, data in meta_data.items():
     if len(prompts) >= num_prompts:
         break
 
-# Base results dir; each prompt gets its own subfolder
-base_output_dir = "results_batched"
-os.makedirs(base_output_dir, exist_ok=True)
-
+#############################
+#      Pruning ratios              
+#############################
 # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64] 13 scales
 # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-# pruning_scales = "32:0.1,40:0.1,48:0.2,64:1.0"
-pruning_scales = "48:0.0,64:0.0"
-
+pruning_scales = "32:0.4,40:0.5,48:0.6,64:0.7"
+# pruning_scales = "48:0.1,64:0.2"
 
 def parse_pruning_scales(spec: str):
     if not spec:
@@ -60,7 +56,6 @@ def parse_pruning_scales(spec: str):
         scale_str, ratio_str = entry.split(':')
         result[int(scale_str)] = float(ratio_str)
     return result or None
-
 
 parsed_prune_scales = parse_pruning_scales(pruning_scales)
 
@@ -89,6 +84,7 @@ args = argparse.Namespace(
     save_file='tmp.jpg',
     prune_scales=pruning_scales,
     prune_scale_list=parsed_prune_scales,
+    start_entropy_scale=24,
 )
 
 # load text encoder
@@ -139,6 +135,12 @@ with torch.inference_mode():
                 metadata_path = os.path.join(root_output_dir, "config.json")
 
                 print(f"\n=== Generating for prompt '{name}': '{prompt_text}' ===")
+                
+                # Setup pruning visualization
+                reset_pruned_data()
+                set_pruned_output_dir(root_output_dir)
+
+                # --- START TIMING ---
                 start_event.record()
 
                 generated_image = gen_one_img(
@@ -161,14 +163,22 @@ with torch.inference_mode():
                     enable_positive_prompt=enable_positive_prompt,
                     save_intermediate_results=False,
                     save_dir=root_output_dir,   # <<< all intermediate images & fourier here
-                    per_scale_infer=True
+                    per_scale_infer=per_scale_infer
                 )
+                
+                end_event.record()
+                torch.cuda.synchronize()
+                latency_ms = start_event.elapsed_time(end_event)
+                # --- END TIMING ---
 
                 # save main generated image as 1.jpg in that folder
                 img_path = os.path.join(root_output_dir, "1.jpg")
                 cv2.imwrite(img_path, generated_image.cpu().numpy())
-                print(f"Saved image for '{name}' to {os.path.abspath(img_path)}")
+                print(f"Saved image for '{name}' to {os.path.abspath(img_path)} | Latency: {latency_ms:.2f} ms")
 
+                # save the pruned tokens
+                # finalize_pruned_tokens()
+                # plot_pruned_tokens()
                 # per-prompt metadata
                 prompt_record = {
                     "prompt_name": name,
@@ -182,6 +192,7 @@ with torch.inference_mode():
                             "pruning_scales": parsed_prune_scales or {},
                             "pruning_scales_raw": pruning_scales,
                             "prompt": prompt_record,
+                            "latency_ms": latency_ms, # Added latency here
                         },
                         f,
                         ensure_ascii=False,
@@ -200,11 +211,14 @@ with torch.inference_mode():
                 batch_texts = [t for (_, t) in batch_items]
 
                 print(f"\n=== Generating batch {b_start // batch_size + 1} (B={len(batch_texts)}) ===")
+                
+                # Setup pruning visualization for the batch
+                reset_pruned_data()
+                set_pruned_output_dir(base_output_dir)
+
+                # --- START TIMING (BATCH) ---
                 start_event.record()
 
-                # NOTE: Infinity uses a single RNG per generation call, so all
-                # samples in the batch share the same seed stream. Prompts still
-                # differ, so outputs differ, but you won't get per-sample seeds.
                 batch_images = batch_gen_img(
                     infinity,
                     vae,
@@ -226,11 +240,21 @@ with torch.inference_mode():
                     enable_positive_prompt=enable_positive_prompt,
                     save_intermediate_results=False,
                     save_dir=base_output_dir,
-                    per_scale_infer=True,
+                    per_scale_infer=per_scale_infer,
                 )
+                
+                end_event.record()
+                torch.cuda.synchronize()
+                batch_latency_ms = start_event.elapsed_time(end_event)
+                # Average latency per image if you prefer, or just raw batch latency
+                avg_latency_ms = batch_latency_ms / len(batch_texts)
+                # --- END TIMING (BATCH) ---
+
+                # Save the pruned tokens for the whole batch
+                # batch_json_path = finalize_pruned_tokens()
 
                 # Save each image and metadata just like the single-image path.
-                for name, prompt_text, generated_image in zip(batch_names, batch_texts, batch_images):
+                for i, (name, prompt_text, generated_image) in enumerate(zip(batch_names, batch_texts, batch_images)):
                     root_output_dir = os.path.join(base_output_dir, f"gen_images_{name}")
                     os.makedirs(root_output_dir, exist_ok=True)
                     metadata_path = os.path.join(root_output_dir, "config.json")
@@ -238,6 +262,10 @@ with torch.inference_mode():
                     img_path = os.path.join(root_output_dir, "1.jpg")
                     cv2.imwrite(img_path, generated_image.cpu().numpy())
                     print(f"Saved image for '{name}' to {os.path.abspath(img_path)}")
+
+                    # plot the pruned tokens for this image in the batch
+                    # if batch_json_path:
+                    #     plot_pruned_tokens(img_path=img_path, json_path=batch_json_path, batch_idx=i)
 
                     prompt_record = {
                         "prompt_name": name,
@@ -251,24 +279,11 @@ with torch.inference_mode():
                                 "pruning_scales": parsed_prune_scales or {},
                                 "pruning_scales_raw": pruning_scales,
                                 "prompt": prompt_record,
+                                "latency_ms": avg_latency_ms, # Storing average latency per image for batch
+                                "batch_latency_ms": batch_latency_ms # Optional: store total batch time
                             },
                             f,
                             ensure_ascii=False,
                             indent=2,
                         )
                     global_prompt_records.append(prompt_record)
-
-# # optional global config across all prompts
-# global_metadata_path = os.path.join(base_output_dir, "config_all.json")
-# with open(global_metadata_path, "w", encoding="utf-8") as f:
-#     json.dump(
-#         {
-#             "pruning_scales": parsed_prune_scales or {},
-#             "pruning_scales_raw": pruning_scales,
-#             "prompts": global_prompt_records,
-#         },
-#         f,
-#         ensure_ascii=False,
-#         indent=2,
-#     )
-# print(f"\nSaved global prompt metadata to {os.path.abspath(global_metadata_path)}")

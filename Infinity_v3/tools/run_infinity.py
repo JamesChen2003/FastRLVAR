@@ -500,6 +500,7 @@ def load_infinity(
     with torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True), torch.no_grad():
         model_kwargs = model_kwargs or {}
         default_prune_cfg = model_kwargs.pop("prune_scale_list", None)
+        start_entropy_scale = model_kwargs.pop("start_entropy_scale", 24)
 
         infinity_test: Infinity = Infinity(
             vae_local=vae, text_channels=text_channels, text_maxlen=text_maxlen,
@@ -518,6 +519,7 @@ def load_infinity(
             inference_mode=True,
             train_h_div_w_list=[1.0],
             prune_scale_list=default_prune_cfg,
+            start_entropy_scale=start_entropy_scale,
             **model_kwargs,
         ).to(device=device)
         print(f'[you selected Infinity with {model_kwargs=}] model size: {sum(p.numel() for p in infinity_test.parameters())/1e9:.2f}B, bf16={bf16}')
@@ -627,6 +629,10 @@ def load_transformer(vae, args, device='cuda'):
     prune_cfg = getattr(args, 'prune_scale_list', None)
     if prune_cfg:
         kwargs_model["prune_scale_list"] = prune_cfg
+    
+    start_entropy_scale = getattr(args, 'start_entropy_scale', 24)
+    kwargs_model["start_entropy_scale"] = start_entropy_scale
+
     infinity = load_infinity(
         rope2d_each_sa_layer=args.rope2d_each_sa_layer, 
         rope2d_normalized_by_hw=args.rope2d_normalized_by_hw,

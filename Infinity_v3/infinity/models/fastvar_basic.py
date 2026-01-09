@@ -22,6 +22,7 @@ except:
     flash_attn_func, flash_attn_varlen_kvpacked_func = None, None
 
 from infinity.models.flashattn_entropy import flash_attention_entropy
+from infinity.utils.plot_pruned_tokens import save_pruned_tokens
 
 # Uncomment this function if you want to benchmark sppedup with vanilla attn.
 def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
@@ -50,7 +51,7 @@ def slow_attn(query, key, value, scale: float, attn_mask=None, dropout_p=0.0):
 # from torch.nn.functional import scaled_dot_product_attention as slow_attn
 from torch.nn.utils.rnn import pad_sequence
 
-from infinity.models.fastvar_utils import compute_merge, compute_merge_entropy
+from infinity.models.fastvar_utils import compute_merge, compute_merge_entropy, do_nothing, compute_merge_hybrid
 
 # Import flash_attn's fused ops
 try:
@@ -225,7 +226,9 @@ class FastVARSelfAttention(nn.Module):
         self.cached_v = None
     
     # NOTE: attn_bias_or_two_vector is None during inference
-    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0,rope_idx=None,ori_len=0):
+    def forward(self, x, attn_bias_or_two_vector: Union[torch.Tensor, Tuple[torch.IntTensor, torch.IntTensor]], 
+        attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, 
+        scale_ind=0, rope_idx=None, ori_len=0, use_entropy=False):
         """
         :param (fp32) x: shaped (B or batch_size, L or seq_length, C or hidden_dim); if seq-parallel is used, the `L` dim would be shared
         :param (fp32) attn_bias_or_two_vector:
@@ -273,6 +276,13 @@ class FastVARSelfAttention(nn.Module):
             if self.cached_k is None: self.cached_k = k; self.cached_v = v
             else: k = self.cached_k = torch.cat((self.cached_k, k), dim=L_dim); v = self.cached_v = torch.cat((self.cached_v, v), dim=L_dim) # 10,521
         
+        if use_entropy:
+            q_heads, k_heads, v_heads = q, k, v
+            # attn_out, entropy_scores = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
+            attn_out, entropy_scores, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale, use_entropy=True)
+            oup = attn_out.transpose(1, 2).reshape(B, L, C)
+            return self.proj_drop(self.proj(oup)), entropy_scores
+
         if self.using_flash:
             if attn_bias_or_two_vector is not None: # training
                 kw = dict(VAR_visible_kvlen=attn_bias_or_two_vector[0], VAR_invisible_qlen=attn_bias_or_two_vector[1])
@@ -289,14 +299,10 @@ class FastVARSelfAttention(nn.Module):
                 if flash_attn_func is not None:
                     oup = flash_attn_func(q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
                 else:
-                    attn_mask = attn_bias_or_two_vector
-                    # attn_out, entropy_scores = slow_attn(query=q_heads, key=k_heads, value=v_heads, scale=self.scale, attn_mask=attn_mask, dropout_p=0)
-                    attn_out, entropy_scores, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale)
+                    attn_out, _, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale, use_entropy=False)
                     oup = attn_out.transpose(1, 2).reshape(B, L, C)
-
-            # oup: bf16
         
-        return self.proj_drop(self.proj(oup)), entropy_scores
+        return self.proj_drop(self.proj(oup)), None
     
     def extra_repr(self) -> str:
         tail = ''
@@ -410,9 +416,9 @@ class CrossAttention(nn.Module):
             k_padded = pad_sequence([chunk[:, 0] for chunk in kv_chunks], batch_first=True)
             v_padded = pad_sequence([chunk[:, 1] for chunk in kv_chunks], batch_first=True)
 
-            q_heads = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
-            k_heads = k_padded.transpose(1, 2)
-            v_heads = v_padded.transpose(1, 2)
+            q_heads = q_compact.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+            k_heads = k_padded.transpose(1, 2).contiguous()
+            v_heads = v_padded.transpose(1, 2).contiguous()
 
             max_len = k_heads.shape[2]
             lengths_tensor = torch.tensor(lengths, device=k_heads.device, dtype=torch.long)
@@ -420,8 +426,8 @@ class CrossAttention(nn.Module):
             attn_mask = torch.zeros(B, 1, 1, max_len, device=q_heads.device, dtype=torch.float32)
             attn_mask.masked_fill_(key_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-            attn_out, entropy_scores = slow_attn(q_heads, k_heads, v_heads, attn_mask=attn_mask, dropout_p=0.0, scale=self.scale)
-            # attn_out, entropy_scores, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale)
+            # attn_out, entropy_scores = slow_attn(q_heads, k_heads, v_heads, attn_mask=attn_mask, dropout_p=0.0, scale=self.scale)
+            attn_out, _, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale, use_entropy=False)
             oup = attn_out.transpose(1, 2).reshape(B, Lq, -1)
  
         return self.proj_drop(self.proj(oup))
@@ -431,7 +437,13 @@ class CrossAttention(nn.Module):
 
 
 
+from infinity.utils.plot_pruned_tokens import save_pruned_tokens
+
 class FastVARCrossAttnBlock(nn.Module):
+    # Class-level variables to share anchor entropy between blocks and scales
+    anchor_entropy_current_scale = None
+    last_scale_ind = -1
+
     def __init__(
         self,
         embed_dim, kv_dim, cross_attn_layer_scale, cond_dim, act: bool, shared_aln: bool, norm_layer: partial,
@@ -439,6 +451,7 @@ class FastVARCrossAttnBlock(nn.Module):
         swiglu=False, customized_flash_attn=False, fused_mlp=False, fused_norm_func=None, checkpointing_sa_only=False,
         use_flex_attn=False, batch_size=2, pad_to_multiplier=1, apply_rope2d=False, rope2d_normalized_by_hw=False,
         prune_scale_list=None,
+        start_entropy_scale=24,
     ):
         super(FastVARCrossAttnBlock, self).__init__()
         self.C, self.D = embed_dim, cond_dim
@@ -470,6 +483,7 @@ class FastVARCrossAttnBlock(nn.Module):
             self.ca_gamma = 1
         
         self.checkpointing_sa_only = checkpointing_sa_only
+        self.start_entropy_scale = start_entropy_scale
 
         self.previous_scale_cache_self_attn = None
         self.previous_scale_cache_cross_attn = None
@@ -477,7 +491,11 @@ class FastVARCrossAttnBlock(nn.Module):
         self.cached_size = [24, 24] # we cahce the scale at 24 as cached feature for subsequant feature restoration
         # self.cached_size = [8, 8] # we cahce the scale at 24 as cached feature for subsequant feature restoration
         self.prune_scale_list = prune_scale_list
+        self.pruned_entropy = None
 
+        self.anchor_layer = 7
+        self.local_ratio = 0.75
+        # self.global_layers = [0,1,2,3,9,11,19,20,21,23,25,27,30,31]
     def calc_token_entropy(attn_matrix):
         epsilon = 1e-6
         entropy = -torch.sum(attn_matrix * torch.log(attn_matrix + epsilon), dim=-1)
@@ -486,35 +504,122 @@ class FastVARCrossAttnBlock(nn.Module):
     # NOTE: attn_bias_or_two_vector is None during inference
     def forward(self, x, cond_BD, ca_kv, attn_bias_or_two_vector, attn_fn=None, scale_schedule=None, rope2d_freqs_grid=None, scale_ind=0, layer_idx=-1, x_shape=None):
         gamma1, gamma2, scale1, scale2, shift1, shift2 = (self.ada_gss + cond_BD).unbind(2) # 116C + B16C =unbind(2)=> 6 B1C
-        is_later_layer = True if layer_idx in list(range(3,28)) else False
-        # merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
-        idx_fn = None
-        shortcut = x
-        # x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale1, shift=shift1)
-        x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
-        x_sa, pruned_entropy = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind,rope_idx=idx_fn,ori_len=shortcut.shape[1])
-        x_sa = x_sa.mul_(gamma1)
+        is_later_layer = True if layer_idx in list(range(4,28)) else False
+        
+        # ------------------------------------------------------------------ #
+        # 1) Scale management for shared anchor entropy
+        # ------------------------------------------------------------------ #
+        if FastVARCrossAttnBlock.last_scale_ind != scale_ind:
+            FastVARCrossAttnBlock.last_scale_ind = scale_ind
 
-        # x_sa = unmerge_fn(x_sa,self.previous_scale_cache_self_attn,self.cached_size)
+        original_w = x_shape[2] if x_shape is not None else 0
+        original_h = x_shape[1] if x_shape is not None else 0
+        
+        # Cross-scale anchor reuse: if layer 0, rescale existing anchor entropy (from previous scale)
+        if layer_idx == 0 and FastVARCrossAttnBlock.anchor_entropy_current_scale is not None:
+            old_entropy = FastVARCrossAttnBlock.anchor_entropy_current_scale
+            # old_entropy shape: (B, H, L)
+            B_old, H_old, L_old = old_entropy.shape
+            side_old = int(math.sqrt(L_old))
+            
+            # Match current batch size (e.g. if CFG was dropped)
+            current_B = x.shape[0]
+            if current_B < B_old:
+                old_entropy = old_entropy[:current_B]
+            
+            # Rescale via interpolation (assuming square for now)
+            entropy_4d = old_entropy.view(-1, H_old, side_old, side_old) # Treat H as channels
+            rescaled_entropy = F.interpolate(entropy_4d.float(), size=(original_h, original_w), mode='area')
+            FastVARCrossAttnBlock.anchor_entropy_current_scale = rescaled_entropy.view(current_B, H_old, -1).to(old_entropy.dtype)
+        
+        # Decide if we are in the pruning regime
+        # Optimization: update entropy only in anchor blocks
+        in_prune_regime = is_later_layer and self.prune_scale_list is not None and original_w in self.prune_scale_list and original_w >= self.start_entropy_scale
+        
+        shortcut = x
+        idx_fn = None
+        
+        # ------------------------------------------------------------------ #
+        # 2) Self-Attention and Pruning Mapping
+        # ------------------------------------------------------------------ #
+        # Default merge functions (identity)
+        merge_fn, unmerge_fn, idx_fn = (do_nothing, do_nothing, None)
+        
+        if in_prune_regime:
+            if layer_idx == self.anchor_layer:
+                # This is the anchor block: compute full SA and update cache
+                x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
+                x_sa, block_entropy = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=None, ori_len=shortcut.shape[1], use_entropy=True)
+                
+                # Update anchor cache for subsequent non-anchor layers
+                FastVARCrossAttnBlock.anchor_entropy_current_scale = block_entropy
+            else:
+                # Not an anchor: use hybrid pruning (entropy map from anchor + local L2 importance)
+                anchor_entropy = FastVARCrossAttnBlock.anchor_entropy_current_scale
+                if anchor_entropy is not None:
+                    # [UPDATE 1]: Reduced pruning ratio for Self-Attention
+                    self_attn_reduce_ratio = 0.75
+                    original_ratio = self.prune_scale_list.get(original_w)
+                    scaled_prune_list_sa = {k: v * self_attn_reduce_ratio for k, v in self.prune_scale_list.items()} if self.prune_scale_list else None
+                    
+                    # Get pruning map using hybrid logic, but log the ORIGINAL ratio
+                    m_sa, u_sa, id_sa = compute_merge_hybrid(x, attn_entropy=anchor_entropy, local_ratio=self.local_ratio, 
+                                                             prune_scale_list=scaled_prune_list_sa, is_later_layer=is_later_layer, 
+                                                             x_shape=x_shape, override_log_ratio=original_ratio)
+                    
+                    # Pruned Self-Attention
+                    x_sa_pruned = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=m_sa(x), scale=scale1, shift=shift1)
+                    x_sa_pruned, _ = self.sa(x_sa_pruned, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=id_sa, ori_len=shortcut.shape[1], use_entropy=False)
+                    # Restore sequence length
+                    x_sa = u_sa(x_sa_pruned, self.previous_scale_cache_self_attn, self.cached_size)
+                else:
+                    # Fallback (should not happen if layers process in order)
+                    x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
+                    x_sa, _ = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=None, ori_len=shortcut.shape[1], use_entropy=False)
+        else:
+            # Normal forward (No pruning or before start_entropy_scale)
+            if layer_idx == self.anchor_layer and original_w >= self.start_entropy_scale:
+                # No pruning at this scale, but Layer 7 still computes entropy for cross-scale anchor reuse
+                x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
+                x_sa, block_entropy = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=None, ori_len=shortcut.shape[1], use_entropy=True)
+                FastVARCrossAttnBlock.anchor_entropy_current_scale = block_entropy
+            else:
+                x_sa = self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x, scale=scale1, shift=shift1)
+                x_sa, _ = self.sa(x_sa, attn_bias_or_two_vector, attn_fn, scale_schedule, rope2d_freqs_grid, scale_ind=scale_ind, rope_idx=None, ori_len=shortcut.shape[1], use_entropy=False)
+
+        x_sa = x_sa.mul_(gamma1)
         if x.shape[1] in [self.cached_size[0]*self.cached_size[1]]:
             self.previous_scale_cache_self_attn = x_sa
         x = shortcut + self.drop_path(x_sa)
+        
+        # ------------------------------------------------------------------ #
+        # 3) Cross-Attention and FFN (Pruned using a fresh map)
+        # ------------------------------------------------------------------ #
+        # NOTE: save_pruned_tokens commented out
+        # save_pruned_tokens(pruned_entropy, x_shape, self.prune_scale_list, layer_idx=layer_idx)
 
-        # merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
-        merge_fn, unmerge_fn, idx_fn = compute_merge_entropy(x, attn_entropy= pruned_entropy, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
-        x_ca = unmerge_fn(self.ca(self.ca_norm(merge_fn(x)), ca_kv).float().mul_(self.ca_gamma),self.previous_scale_cache_cross_attn, self.cached_size)
+        # [UPDATE 2]: Use compute_merge_hybrid after SA for CA and FFN
+        if in_prune_regime:
+            anchor_entropy = FastVARCrossAttnBlock.anchor_entropy_current_scale
+            if anchor_entropy is not None:
+                merge_fn, unmerge_fn, idx_fn = compute_merge_hybrid(x, attn_entropy=anchor_entropy, local_ratio=self.local_ratio, 
+                                                                   prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, 
+                                                                   x_shape=x_shape)
+            else:
+                # Fallback MSE-based pruning
+                merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
+        else:
+            merge_fn, unmerge_fn, idx_fn = (do_nothing, do_nothing, None)
+        x_ca = unmerge_fn(self.ca(self.ca_norm(merge_fn(x)), ca_kv).float().mul_(self.ca_gamma), self.previous_scale_cache_cross_attn, self.cached_size)
         if x.shape[1] in [self.cached_size[0]*self.cached_size[1]]:
             self.previous_scale_cache_cross_attn = x_ca
         x = x + x_ca
 
-        # merge_fn, unmerge_fn, idx_fn = compute_merge(x, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
-        merge_fn, unmerge_fn, idx_fn = compute_merge_entropy(x, attn_entropy= pruned_entropy, prune_scale_list=self.prune_scale_list, is_later_layer=is_later_layer, x_shape=x_shape)
-        x_ffn = unmerge_fn(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale2, shift=shift2)).mul(gamma2),self.previous_scale_cache_ffn,self.cached_size)
+        x_ffn = unmerge_fn(self.ffn(self.fused_norm_func(C=self.C, eps=self.norm_eps, x=merge_fn(x), scale=scale2, shift=shift2)).mul(gamma2), self.previous_scale_cache_ffn, self.cached_size)
         if x.shape[1] in [self.cached_size[0] * self.cached_size[1]]:
             self.previous_scale_cache_ffn = x_ffn
 
-        x = x + self.drop_path(x_ffn) # this mul(gamma2) cannot be in-placed cuz we possibly use FusedMLP
-
+        x = x + self.drop_path(x_ffn)
         return x
 
 
