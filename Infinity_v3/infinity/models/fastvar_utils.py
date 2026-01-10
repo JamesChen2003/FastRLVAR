@@ -169,10 +169,15 @@ def compute_merge(
     ratio = prune_ratios.get(original_w)
 
     if ratio is not None and is_later_layer:
+        # Fast path: ratio <= 0 means "keep all tokens" -> no-op (avoid argsort/gather/scatter)
+        ratio = float(max(min(ratio, 1.0), 0.0))
+        if ratio <= 0.0:
+            m, u, id_fn = (do_nothing, do_nothing, do_nothing)
+            return m, u, id_fn
+
         # Clamp ratio into [0, 1] for safety and ensure we always keep at least
         # one token, otherwise many downstream ops (e.g. rotary embedding) fail
         # on zero-length sequences.
-        ratio = float(max(min(ratio, 1.0), 0.0))
         remaining_tokens = int(x.shape[1] * (1.0 - ratio))
         if remaining_tokens <= 0:
             remaining_tokens = 1
@@ -208,6 +213,12 @@ def compute_merge_entropy(
     ratio = prune_ratios.get(original_w)
 
     if ratio is not None and is_later_layer and attn_entropy is not None:
+        # Fast path: ratio <= 0 means "keep all tokens" -> no-op
+        ratio = float(max(min(ratio, 1.0), 0.0))
+        if ratio <= 0.0:
+            m, u, id_fn = (do_nothing, do_nothing, do_nothing)
+            return m, u, id_fn
+
         remaining_tokens = int(x.shape[1] * (1.0 - ratio))
         if remaining_tokens <= 0:
             remaining_tokens = 1
@@ -245,6 +256,12 @@ def compute_merge_hybrid(
     ratio = prune_ratios.get(original_w)
 
     if ratio is not None and is_later_layer and attn_entropy is not None:
+        # Fast path: ratio <= 0 means "keep all tokens" -> no-op (avoid scoring/sorting/gather/scatter)
+        ratio = float(max(min(ratio, 1.0), 0.0))
+        if ratio <= 0.0:
+            m, u, id_fn = (do_nothing, do_nothing, do_nothing)
+            return m, u, id_fn
+
         remaining_tokens = int(x.shape[1] * (1.0 - ratio))
         if remaining_tokens <= 0:
             remaining_tokens = 1
