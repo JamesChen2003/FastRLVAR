@@ -86,7 +86,7 @@ register(
 )
 
 my_config = {
-    "run_id": "hybrid_PPO_1",
+    "run_id": "hybrid_PPO_3",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
@@ -102,6 +102,10 @@ my_config = {
     # VAREnv optimization: we pre-run the first N scales inside reset() and only
     # learn pruning decisions on later scales.
     "skip_first_N_scales": 9,
+
+    "base_steps_per_episode": 4,
+    "ppo_batch_size_base": 32,          
+    "sac_learning_starts_base": 40,     
 }
 
 # NOTE: rollout_steps and timesteps_per_epoch depend on the number of scales,
@@ -510,6 +514,29 @@ if __name__ == "__main__":
     # new per-episode step count.
     my_config["rollout_steps"] = steps_per_episode * 16
 
+    # ----------------- scale step-coupled hyperparams -----------------
+    base_steps = int(my_config.get("base_steps_per_episode", 13))
+    if base_steps <= 0:
+        raise ValueError(f"base_steps_per_episode must be > 0, got {base_steps}")
+    scale_factor = float(steps_per_episode) / float(base_steps)
+
+    # PPO batch size: scale and keep it divisible by steps_per_episode, and <= rollout_steps * n_envs.
+    ppo_batch_target = int(round(int(my_config.get("ppo_batch_size_base", 104)) * scale_factor))
+    ppo_batch_target = max(steps_per_episode, ppo_batch_target)
+    # snap down to a multiple of steps_per_episode
+    ppo_batch_target = (ppo_batch_target // steps_per_episode) * steps_per_episode
+    # hard constraint in SB3 PPO: batch_size <= n_steps * n_envs
+    max_ppo_batch = int(my_config["rollout_steps"]) * int(my_config["num_train_envs"])
+    if ppo_batch_target > max_ppo_batch:
+        ppo_batch_target = max(steps_per_episode, (max_ppo_batch // steps_per_episode) * steps_per_episode)
+    my_config["ppo_batch_size"] = int(max(1, ppo_batch_target))
+
+    # SAC learning_starts: scale and align to whole episodes (multiple of steps_per_episode).
+    sac_ls_target = int(round(int(my_config.get("sac_learning_starts_base", 130)) * scale_factor))
+    sac_ls_target = max(steps_per_episode, sac_ls_target)
+    sac_ls_target = (sac_ls_target // steps_per_episode) * steps_per_episode
+    my_config["sac_learning_starts"] = int(max(0, sac_ls_target))
+
     # Train for prompt_pool_size episodes per epoch (times iterations_per_prompt),
     # using the new per-episode step count.
     my_config["timesteps_per_epoch"] = (
@@ -565,11 +592,11 @@ if __name__ == "__main__":
             device=device,
             # PPO-specific hyperparams
             n_steps=my_config["rollout_steps"],  
-            batch_size=104,                      
+            batch_size=my_config["ppo_batch_size"],
             n_epochs=4,                          
             learning_rate=1e-4,                  
             ent_coef=0.001,
-            gamma=0.995,                          
+            gamma=0.99,                          
         )
     elif my_config["algorithm"] == SAC:
         model = my_config["algorithm"](
@@ -585,7 +612,7 @@ if __name__ == "__main__":
             gradient_steps=4,     
             learning_rate=3e-4,
             buffer_size=20000,      # small, safe
-            learning_starts=130,
+            learning_starts=my_config["sac_learning_starts"],
             tau=0.005,
             gamma=0.99,
         )

@@ -175,8 +175,12 @@ class VAREnv(gym.Env):
         prune_ratio=0 and store both decoded images and summed_codes.
         """
         num_scales = len(self.scale_schedule)
+        # We only need golden outputs for the scales that contribute to the reward.
+        # With our env design, that's scales >= skip_first_N_scales (typically the last 4).
+        cache_start = int(max(min(getattr(self, "skip_first_N_scales", 0), num_scales), 0))
+        needed_scales = list(range(cache_start, num_scales))
         # Already fully cached in memory for this prompt
-        if self._golden_imgs and len(self._golden_imgs) == num_scales:
+        if self._golden_imgs and all((si in self._golden_imgs) for si in needed_scales):
             return True
 
         # If no explicit seed is provided, fall back to the prompt-based base seed
@@ -197,7 +201,7 @@ class VAREnv(gym.Env):
         # (it requires `state is None` only for `scale_ind == 0`).
         # ------------------------------------------------------------------
         all_cached = True
-        for si in range(num_scales):
+        for si in needed_scales:
             img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
             codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
             if not (os.path.exists(img_path) and os.path.exists(codes_path)):
@@ -208,10 +212,11 @@ class VAREnv(gym.Env):
         if all_cached:
             print(
                 f"[VAREnv] ✅ Golden cache hit: prompt_idx={self.prompt_idx} "
-                f"prompt_id={self.prompt_id[:8]} seed={g_seed_local} dir={prompt_dir}"
+                f"prompt_id={self.prompt_id[:8]} seed={g_seed_local} dir={prompt_dir} "
+                f"(scales {cache_start}..{num_scales-1})"
             )
             with torch.no_grad():
-                for si in range(num_scales):
+                for si in needed_scales:
                     img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
                     codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
 
@@ -233,10 +238,11 @@ class VAREnv(gym.Env):
         # consistent forward pass starting from scale 0.
         print(
             f"[VAREnv] 🧱 Golden cache miss → generating: prompt_idx={self.prompt_idx} "
-            f"prompt_id={self.prompt_id[:8]} seed={g_seed_local} dir={prompt_dir}"
+            f"prompt_id={self.prompt_id[:8]} seed={g_seed_local} dir={prompt_dir} "
+            f"(scales {cache_start}..{num_scales-1})"
         )
         t0 = time.time()
-        for si in range(num_scales):
+        for si in needed_scales:
             img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
             codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
             if os.path.exists(img_path):
@@ -290,19 +296,21 @@ class VAREnv(gym.Env):
                         save_dir=prompt_dir,
                         state=state,
                     )
-                    if isinstance(img, torch.Tensor):
-                        # img: [B, H, W, C], uint8 BGR (matches Infinity + cv2.imwrite)
-                        img_bgr = img[0].cpu().numpy()  # uint8 BGR for saving
-                        # Convert to RGB float in [0, 1] for PSNR
-                        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                        golden = torch.from_numpy(img_rgb).float() / 255.0  # [H, W, C], RGB
-                        self._golden_imgs[si] = golden.cpu()
-                        # Save golden image to disk (BGR)
-                        cv2.imwrite(img_path, img_bgr)
-                    if isinstance(summed_codes, torch.Tensor):
-                        # Save golden summed_codes and cache in memory
-                        torch.save(summed_codes.cpu(), codes_path)
-                        self._golden_codes[si] = summed_codes.cpu()
+                    # Only store/cache the scales we actually use for reward.
+                    if si in needed_scales:
+                        if isinstance(img, torch.Tensor):
+                            # img: [B, H, W, C], uint8 BGR (matches Infinity + cv2.imwrite)
+                            img_bgr = img[0].cpu().numpy()  # uint8 BGR for saving
+                            # Convert to RGB float in [0, 1] for similarity
+                            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                            golden = torch.from_numpy(img_rgb).float() / 255.0  # [H, W, C], RGB
+                            self._golden_imgs[si] = golden.cpu()
+                            # Save golden image to disk (BGR)
+                            cv2.imwrite(img_path, img_bgr)
+                        if isinstance(summed_codes, torch.Tensor):
+                            # Save golden summed_codes and cache in memory
+                            torch.save(summed_codes.cpu(), codes_path)
+                            self._golden_codes[si] = summed_codes.cpu()
         finally:
             # Restore RNG state so the pruned generation process continues uninterrupted
             self.infinity_test.rng.set_state(rng_state)
