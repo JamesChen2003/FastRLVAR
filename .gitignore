@@ -46,6 +46,11 @@ Infinity_v2/training_tmp_results/
 results/
 Infinity/results/
 Infinity_v2/results/
+Infinity_v3/results/
+Infinity_v3/results_batched/
+
+# Generated metadata/configs under result folders
+**/results*/**/*.json
 
 ############################################################
 # wandb / TensorBoard (all experiment artifacts)

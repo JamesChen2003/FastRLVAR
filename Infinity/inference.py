@@ -23,14 +23,23 @@ text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-
 # }
 with open("/nfs/home/tensore/RL/FastRLVAR/Infinity/infinity/dataset/meta_data.json") as f:
     meta_data = json.load(f)
+# prompts = {
+#     # "cat":       "A cute cat on the grass.",
+#     "city":      "A futuristic city skyline at night.",
+#     "astronaut": "An astronaut painting on the moon.",
+#     # "woman":     "An anime-style portrait of a woman.",
+#     # "man":       "A detailed photo-realistic image of a man."
+# }
+# with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity/evaluation/MJHQ30K/meta_data.json") as f:
+#     meta_data = json.load(f)
 
-prompts = {}
+# prompts = {}
 
-for img_id, data in meta_data.items():
-    if 'people' in data['category']:
-        prompts[img_id] = data['prompt']
-    if len(prompts) >= 5:
-        break
+# for img_id, data in meta_data.items():
+#     if 'people' in data['category']:
+#         prompts[img_id] = data['prompt']
+#     if len(prompts) >= 5:
+#         break
 
 # Base results dir; each prompt gets its own subfolder
 base_output_dir = "results"
@@ -40,7 +49,7 @@ os.makedirs(base_output_dir, exist_ok=True)
 # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
 # pruning_scales = "20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-pruning_scales = "48:1.0,64:1.0"
+pruning_scales = "32:0.4,40:0.5,48:1.0,64:1.0"
 # pruning_scales = "64:1.0"
 
 

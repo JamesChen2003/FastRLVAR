@@ -86,13 +86,13 @@ register(
 )
 
 my_config = {
-    "run_id": "entropy_PPO3",
+    "run_id": "entropy_PPO13",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
     "num_train_envs": 1,
     "epoch_num": 50,
-    "eval_episode_num": 1,
+    "eval_episode_num": 10,  # Evaluate over multiple prompts for more stable metrics
     "prompt_pool_size": 256,
     "iterations_per_prompt": 1,
 }
@@ -161,11 +161,18 @@ def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt
 def eval(env, model, eval_episode_num):
     """
     Evaluate the model on the vectorized FastVAR environment.
+    Always evaluates on the first N prompts to ensure fair comparison across epochs.
     Returns:
         avg_return: average episode return
         avg_quality: average per-step quality_score
         avg_speed: average per-step speed_score
     """
+    # Reset prompt index to ensure we always evaluate on the same set/order of prompts.
+    # NOTE: env.envs[0] is a Monitor wrapper; use .unwrapped to reach VAREnv.
+    base_env = env.envs[0].unwrapped
+    base_env.prompt_idx = -1  # Reset to start from prompt 0
+    base_env._first_reset = True  # Reset the first_reset flag
+    
     avg_return = 0.0
     avg_quality = 0.0
     avg_speed = 0.0
@@ -205,11 +212,14 @@ def eval(env, model, eval_episode_num):
 def train(eval_env, model, config):
     """Train agent using SB3 algorithm and my_config"""
     current_best_return = -float("inf")
+    current_best_quality = -float("inf")
+    current_best_speed = -float("inf")
 
     start_time = time.time()
 
     for epoch in range(config["epoch_num"]):
         epoch_start_time = time.time()
+        steps_before = int(getattr(model, "num_timesteps", 0))
         
         # Enable wandb logging with both WandbCallback and custom episode logger
         callback_list = [
@@ -221,10 +231,20 @@ def train(eval_env, model, config):
         ]
 
         model.learn(
+            # Match SB3 recommended usage (see RL/HW3/train.py):
+            # with reset_num_timesteps=False, SB3 will internally add current num_timesteps
+            # so this trains for an additional `timesteps_per_epoch` each epoch.
             total_timesteps=config["timesteps_per_epoch"],
             reset_num_timesteps=False,
             callback=callback_list,
         )
+        steps_after = int(getattr(model, "num_timesteps", 0))
+        epoch_env_steps = steps_after - steps_before
+        if epoch_env_steps != int(config["timesteps_per_epoch"]):
+            print(
+                f"WARNING: epoch_env_steps={epoch_env_steps} != timesteps_per_epoch={int(config['timesteps_per_epoch'])}. "
+                "This indicates something changed the expected step accounting."
+            )
 
         epoch_duration = time.time() - epoch_start_time
         total_duration = time.time() - start_time
@@ -240,25 +260,49 @@ def train(eval_env, model, config):
         print(f"   - Epoch time: {epoch_duration:.1f}s")
         print(f"   - Eval time: {eval_duration:.1f}s")
         print(f"   - Total time: {total_duration/60:.1f} min")
-        print(f"Performance:")
+        print(f"Performance (averaged over {config['eval_episode_num']} prompts):")
         print(f"   - Avg Return: {avg_return:.3f}")
         print(f"   - Avg Quality Score: {avg_quality:.3f}")
         print(f"   - Avg Speed Score: {avg_speed:.3f}")
+        print(f"   - Env steps this epoch: {epoch_env_steps}")
         
         wandb.log({
             "eval/avg_return": avg_return,
             "eval/avg_quality": avg_quality,
             "eval/avg_speed": avg_speed,
             "epoch": epoch + 1,
-        })
+            "train/epoch_env_steps": epoch_env_steps,
+        }, step=model.num_timesteps)  # Use actual environment steps for consistent x-axis
         
-        ### Save best model (by average return)
+        save_path = config["save_path"]
+        saved_any = False
+        
+        ### Save best model by average return
         if avg_return > current_best_return:
-            print("Saving New Best Model")
+            print("Saving New Best Model (by Return)")
             print(f"   - Previous best return: {current_best_return:.3f} → {avg_return:.3f}")
             current_best_return = avg_return
-            save_path = config["save_path"]
-            model.save(f"{save_path}/best")
+            model.save(f"{save_path}/best_reward")
+            saved_any = True
+        
+        ### Save best model by average quality
+        if avg_quality > current_best_quality:
+            print("Saving New Best Model (by Quality)")
+            print(f"   - Previous best quality: {current_best_quality:.3f} → {avg_quality:.3f}")
+            current_best_quality = avg_quality
+            model.save(f"{save_path}/best_quality")
+            saved_any = True
+        
+        ### Save best model by average speed
+        if avg_speed > current_best_speed:
+            print("Saving New Best Model (by Speed)")
+            print(f"   - Previous best speed: {current_best_speed:.3f} → {avg_speed:.3f}")
+            current_best_speed = avg_speed
+            model.save(f"{save_path}/best_speed")
+            saved_any = True
+        
+        if not saved_any:
+            print("No new best models this epoch")
         print("-"*60)
             
     total_time = (time.time() - start_time)
@@ -407,9 +451,11 @@ if __name__ == "__main__":
         for _ in range(my_config["num_train_envs"])
     ])
     
-    # For eval, also use the same prompt pool (episodes will cycle through prompts)
+    # For eval, use a fixed subset of prompts so metrics stay comparable across epochs.
+    # We still run `eval_episode_num` episodes, which will round-robin over this fixed list.
+    eval_prompt_list = prompt_list[: my_config["eval_episode_num"]]
     eval_env = DummyVecEnv([
-        make_env_factory(prompt_list)
+        make_env_factory(eval_prompt_list)
     ])
     
     print("Creating model...")
@@ -442,7 +488,8 @@ if __name__ == "__main__":
             batch_size=104,                      
             n_epochs=4,                          
             learning_rate=1e-4,                  
-            ent_coef=0.001,                      
+            ent_coef=0.001,
+            gamma=0.995,                          
         )
     elif my_config["algorithm"] == SAC:
         model = my_config["algorithm"](
