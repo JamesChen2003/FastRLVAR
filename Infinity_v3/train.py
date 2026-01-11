@@ -86,7 +86,7 @@ register(
 )
 
 my_config = {
-    "run_id": "hybrid_PPO_3",
+    "run_id": "hybrid_PPO_5",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
@@ -135,7 +135,7 @@ class WandbEpisodeLogger(BaseCallback):
                         'custom/speed_score': episode_info.get('speed_score', 0),
                         'custom/total_reward': episode_info.get('total_reward', 0),
                         'custom/psnr': episode_info.get('psnr', 0),
-                        'custom/dinov3': episode_info.get('dinov3', 0),
+                        'custom/dreamsim': episode_info.get('dreamsim', 0),
                         'custom/prune_ratio': episode_info.get('prune_ratio', 0),
                     },
                     step=self.num_timesteps,
@@ -163,7 +163,7 @@ def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt
             "speed_score",
             "total_reward",
             "psnr",
-            "dinov3",
+            "dreamsim",
             "prune_ratio",
         ),
     )
@@ -184,35 +184,43 @@ def eval(env, model, eval_prompt_pool_size):
     base_env.prompt_idx = -1  # Reset to start from prompt 0
     base_env._first_reset = True  # Reset the first_reset flag
     
+    # NOTE: SB3 VecEnvs (including DummyVecEnv) auto-reset environments when done=True.
+    # If we also call env.reset() per episode, we will skip every other prompt.
     avg_return = 0.0
     avg_quality = 0.0
     avg_speed = 0.0
 
-    for _ in range(eval_prompt_pool_size):
-        obs = env.reset()
-        done = False
-        ep_return = 0.0
-        ep_quality = 0.0
-        ep_speed = 0.0
-        steps = 0
+    obs = env.reset()
+    episodes_done = 0
 
-        while not done:
-            action, _state = model.predict(obs, deterministic=True)
-            obs, rewards, dones, infos = env.step(action)
-            r = float(rewards[0])
-            info = infos[0]
+    ep_return = 0.0
+    ep_quality = 0.0
+    ep_speed = 0.0
+    steps = 0
 
-            ep_return += r
-            ep_quality += info.get("quality_score", 0.0)
-            ep_speed += info.get("speed_score", 0.0)
-            steps += 1
+    while episodes_done < eval_prompt_pool_size:
+        action, _state = model.predict(obs, deterministic=True)
+        obs, rewards, dones, infos = env.step(action)
+        r = float(rewards[0])
+        info = infos[0]
 
-            done = bool(dones[0])
+        ep_return += r
+        ep_quality += info.get("quality_score", 0.0)
+        ep_speed += info.get("speed_score", 0.0)
+        steps += 1
 
-        avg_return += ep_return
-        if steps > 0:
-            avg_quality += ep_quality / steps
-            avg_speed += ep_speed / steps
+        if bool(dones[0]):
+            episodes_done += 1
+            avg_return += ep_return
+            if steps > 0:
+                avg_quality += ep_quality / steps
+                avg_speed += ep_speed / steps
+
+            # Reset per-episode accumulators.
+            ep_return = 0.0
+            ep_quality = 0.0
+            ep_speed = 0.0
+            steps = 0
 
     avg_return /= eval_prompt_pool_size
     avg_quality /= eval_prompt_pool_size

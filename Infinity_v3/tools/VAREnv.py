@@ -56,7 +56,7 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
 
 class VAREnv(gym.Env):
     def __init__(self, infinity_test, vae, scale_schedule, text_tokenizer, text_encoder, prompt, 
-                 alpha: float = 0.7, beta: float = 4.0, 
+                 alpha: float = 0.6, beta: float = 1.0/0.2371, 
                  golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/golden_images",
                  # Inference configuration
                  B: int = 1,
@@ -160,8 +160,8 @@ class VAREnv(gym.Env):
         self.label_B_or_BLT = text_cond_tuple
         # Cache for unpruned (golden) images per scale index, tied to this prompt.
         self._golden_imgs = {}
-        # Optional cache for golden summed_codes per scale (loaded/saved to disk)
-        self._golden_codes = {}
+        # NOTE: we do not persist golden summed_codes; only golden images are used for quality.
+        # NOTE: we do not persist golden summed_codes; only golden images are used for quality.
 
     def _ensure_golden_images(self, g_seed=42, cfg_list=None, tau_list=None,
                               cfg_sc: float = 3, top_k: int = 0, top_p: float = 0.0,
@@ -203,8 +203,7 @@ class VAREnv(gym.Env):
         all_cached = True
         for si in needed_scales:
             img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
-            codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
-            if not (os.path.exists(img_path) and os.path.exists(codes_path)):
+            if not os.path.exists(img_path):
                 all_cached = False
                 break
 
@@ -218,19 +217,12 @@ class VAREnv(gym.Env):
             with torch.no_grad():
                 for si in needed_scales:
                     img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
-                    codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
 
                     img_bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
                     if img_bgr is not None:
                         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
                         golden = torch.from_numpy(img_rgb).float() / 255.0  # [H, W, C], RGB
                         self._golden_imgs[si] = golden.cpu()
-
-                    try:
-                        codes = torch.load(codes_path, map_location="cpu")
-                        self._golden_codes[si] = codes
-                    except Exception:
-                        pass
             return True
 
         # If the cache is incomplete, drop any stale files to avoid mixing
@@ -244,15 +236,9 @@ class VAREnv(gym.Env):
         t0 = time.time()
         for si in needed_scales:
             img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
-            codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
             if os.path.exists(img_path):
                 try:
                     os.remove(img_path)
-                except OSError:
-                    pass
-            if os.path.exists(codes_path):
-                try:
-                    os.remove(codes_path)
                 except OSError:
                     pass
 
@@ -266,7 +252,6 @@ class VAREnv(gym.Env):
                 state = None
                 for si in range(num_scales):
                     img_path = os.path.join(prompt_dir, f"scale_{si}_golden.png")
-                    codes_path = os.path.join(prompt_dir, f"scale_{si}_golden_codes.pt")
 
                     # Run unpruned per-scale inference sequentially so that
                     # `state` is correctly carried across scales.
@@ -307,10 +292,6 @@ class VAREnv(gym.Env):
                             self._golden_imgs[si] = golden.cpu()
                             # Save golden image to disk (BGR)
                             cv2.imwrite(img_path, img_bgr)
-                        if isinstance(summed_codes, torch.Tensor):
-                            # Save golden summed_codes and cache in memory
-                            torch.save(summed_codes.cpu(), codes_path)
-                            self._golden_codes[si] = summed_codes.cpu()
         finally:
             # Restore RNG state so the pruned generation process continues uninterrupted
             self.infinity_test.rng.set_state(rng_state)
@@ -351,48 +332,54 @@ class VAREnv(gym.Env):
         skip_first_N_scales: int,
     ) -> dict:
         """
-        Compute similarity between pruned and golden images using DINOv3 (cosine
-        similarity of pooled features). Also returns PSNR for debugging.
+        Compute similarity between pruned and golden images using DreamSim.
+        Also returns PSNR for debugging.
 
         Returns a dict with:
         - psnr (float)
-        - dinov3 (float, cosine similarity in [-1, 1])
-        - similarity (float, same as dinov3 for downstream reward)
+        - dreamsim (float, similarity in [0, 1])
+        - similarity (float, same as dreamsim for downstream reward)
         """
         if scale_index < skip_first_N_scales:
             return {
                 "psnr": 0.0,
-                "dinov3": 0.0,
+                "dreamsim": 0.0,
                 "similarity": 0.0,
             }
         else:
-            # Lazy import to avoid loading the DINO model unless needed.
-            from tools.dinov3_score import get_dinov3_similarity
+            # Lazy import to avoid loading the DreamSim model unless needed.
+            from tools.dreamsim_score import get_dreamsim_similarity
 
             psnr_val = self._psnr(pruned_img_resized, golden_img)
             pruned_pil = self._to_pil_rgb(pruned_img_resized)
             golden_pil = self._to_pil_rgb(golden_img)
-            dinov3_val = float(get_dinov3_similarity(pruned_pil, golden_pil))
-            dinov3_val = float(max(min(dinov3_val, 1.0), -1.0))
+            dreamsim_val = float(get_dreamsim_similarity(pruned_pil, golden_pil))
+            dreamsim_val = float(max(min(dreamsim_val, 1.0), 0.0))
             return {
                 "psnr": psnr_val,
-                "dinov3": dinov3_val,
-                "similarity": dinov3_val,
+                "dreamsim": dreamsim_val,
+                "similarity": dreamsim_val,
             }
 
     # def quality_func(self, x, a=0.68, b=0.92):
-    def quality_func(self, x, a=0.88, b=0.98):
+    def quality_func(self, x, a=0.94, b=0.985, mode="cosine"):
         """
-        Linear mapping of DINOv3 cosine similarity:
-          x in [a, b] -> [0, 1]
-          x < a -> 0
-          x > b -> 1
+        mode: "linear" or "cosine"
         """
-        if x <= a:
-            return 0.0
-        if x >= b:
-            return 1.0
-        return float((x - a) / (b - a))
+        if mode == "linear":
+            if x <= a:
+                return 0.0
+            if x >= b:
+                return 1.0
+            return float((x - a) / (b - a))
+        elif mode == "cosine":
+            if x < a:
+                return 0.0
+            if x > b:
+                return 1.0
+            return 0.5 * (1 - math.cos(math.pi * (x - a) / (b - a)))
+        else:
+            raise ValueError(f"Invalid mode: {mode}")
 
     def step(self, action):
         # Work with a local copy of the current scale index to avoid off-by-one
@@ -463,11 +450,11 @@ class VAREnv(gym.Env):
         # Move to next scale for the following step
         self.scale_index = current_scale + 1
         
-        # Compute similarity (DINOv3 cosine similarity) against golden image
+        # Compute similarity (DreamSim) against golden image
         # for this scale (if available) and derive a quality_score.
         quality_score = 0.0
         psnr_val = 0.0
-        dinov3_val = 0.0
+        dreamsim_val = 0.0
 
         if isinstance(img, torch.Tensor) and current_scale in self._golden_imgs:
             # Convert pruned image from BGR uint8 to RGB float in [0, 1]
@@ -494,7 +481,7 @@ class VAREnv(gym.Env):
                 skip_first_N_scales=self.skip_first_N_scales,
             )
             psnr_val = metrics["psnr"]
-            dinov3_val = metrics["dinov3"]
+            dreamsim_val = metrics["dreamsim"]
             quality_score = metrics["similarity"]
 
             # Optional debug dump at the last scale
@@ -511,7 +498,7 @@ class VAREnv(gym.Env):
                 cv2.imwrite(os.path.join(self.save_dir, f"golden_img_{current_scale}.png"), golden_img_bgr)
                 print(
                     f"quality_score (similarity): {quality_score:.2f}, "
-                    f"PSNR: {psnr_val:.2f}, DINOv3: {dinov3_val:.4f}"
+                    f"PSNR: {psnr_val:.2f}, DreamSim: {dreamsim_val:.4f}"
                 )
 
         quality_reward = self.quality_func(quality_score)
@@ -568,7 +555,7 @@ class VAREnv(gym.Env):
             "speed_reward": speed_reward,
             "total_reward": reward,
             "psnr": psnr_val,
-            "dinov3": dinov3_val,
+            "dreamsim": dreamsim_val,
             "alpha": self.alpha,
             "reward_components": {
                 "alpha_quality": quality_reward,
@@ -618,8 +605,13 @@ class VAREnv(gym.Env):
             sampling_per_bits=self.sampling_per_bits,
         )
 
-        # Skip the first skip_first_N_scales by running fixed inference
+        # Skip the first skip_first_N_scales by running fixed inference.
+        # We cache the last 2 resized summed_codes (scales skip_first_N_scales-2 and
+        # skip_first_N_scales-1) so the initial observation matches the
+        # "previous-scale context" used in step().
         summed_codes = None
+        prev_codes_resized = None  # codes at scale (skip_first_N_scales - 2)
+        last_codes_resized = None  # codes at scale (skip_first_N_scales - 1)
         with torch.no_grad(), torch.cuda.amp.autocast(enabled=True, dtype=torch.bfloat16, cache_enabled=True):
             for si in range(self.skip_first_N_scales):
                 codes, summed_codes, img, state = self.infinity_test.infer_pruned_per_scale(
@@ -651,22 +643,32 @@ class VAREnv(gym.Env):
                 self.state = state
                 self.scale_index = si + 1
 
-        # Construct initial observation from the result of the last skipped scale
-        if isinstance(summed_codes, torch.Tensor):
-            # Match Infinity's interpolation mode when resizing codes
-            interp_mode = getattr(
-                getattr(self.vae, "quantizer", None),
-                "z_interplote_up",
-                "area",
-            )
-            resized = torch.nn.functional.interpolate(
-                summed_codes,
-                size=(1, self.obs_H, self.obs_W),
-                mode=interp_mode,
-            )  # [B, d, 1, H, W]
-            codes_resized = resized.squeeze(-3)[0].cpu().float()
-        else:
-            codes_resized = torch.zeros(self.obs_channels - 1, self.obs_H, self.obs_W, dtype=torch.float32)
+                # Cache resized codes for the last two skipped scales.
+                if isinstance(summed_codes, torch.Tensor):
+                    interp_mode = getattr(
+                        getattr(self.vae, "quantizer", None),
+                        "z_interplote_up",
+                        "area",
+                    )
+                    resized_si = torch.nn.functional.interpolate(
+                        summed_codes,
+                        size=(1, self.obs_H, self.obs_W),
+                        mode=interp_mode,
+                    )  # [B, d, 1, H, W]
+                    codes_resized_si = resized_si.squeeze(-3)[0].detach().cpu().float()
+                    if si == self.skip_first_N_scales - 2:
+                        prev_codes_resized = codes_resized_si
+                    if si == self.skip_first_N_scales - 1:
+                        last_codes_resized = codes_resized_si
+
+        # Construct initial observation:
+        # - first 32 channels: codes from scale (skip_first_N_scales - 2)
+        # - next  32 channels: codes from scale (skip_first_N_scales - 1)
+        # This aligns with step() where the observation includes previous-scale context.
+        if prev_codes_resized is None:
+            prev_codes_resized = torch.zeros(32, self.obs_H, self.obs_W, dtype=torch.float32)
+        if last_codes_resized is None:
+            last_codes_resized = torch.zeros(32, self.obs_H, self.obs_W, dtype=torch.float32)
 
         # Scale-index channel (normalized) for the last skipped scale
         num_scales = len(self.scale_schedule)
@@ -674,11 +676,10 @@ class VAREnv(gym.Env):
         scale_plane = torch.full(
             (1, self.obs_H, self.obs_W),
             norm_scale,
-            dtype=codes_resized.dtype,
+            dtype=last_codes_resized.dtype,
         )
         
-        # Following the original logic where first 32 channels are zeros if pre_obs was None
-        full_obs = torch.cat([0 * codes_resized, codes_resized, scale_plane], dim=0)
+        full_obs = torch.cat([prev_codes_resized, last_codes_resized, scale_plane], dim=0)
         obs = full_obs.numpy().astype(np.float32)
         self.pre_obs = obs
         

@@ -97,6 +97,11 @@ Infinity_v2/entropy_PPO1/
 Infinity/checkpoint/*.pth
 Infinity_v2/checkpoint/*.pth
 
+# Ignore all files in checkpoint folders (Infinity / Infinity_v2 / Infinity_v3)
+Infinity/checkpoint/**
+Infinity_v2/checkpoint/**
+Infinity_v3/checkpoint/**
+
 # Generic model directories that usually only contain weights
 **/checkpoints/
 **/models/**/pytorch_model.bin
