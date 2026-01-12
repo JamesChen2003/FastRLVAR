@@ -19,9 +19,9 @@ if PROJECT_ROOT not in sys.path:
 
 from tools.run_infinity import *
  
-model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_2b_reg.pth'
-vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_vae_d32reg.pth'
-text_encoder_ckpt = 'google/flan-t5-xl'
+model_path = '/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
+vae_path   = '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
+text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001'
 
 args=argparse.Namespace(
     pn='1M', # 1M, 0.60M, 0.25M, 0.06M
@@ -71,10 +71,10 @@ scale_schedule = dynamic_resolution_h_w[h_div_w_template_][args.pn]['scales']
 scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
 
 
-with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/meta_data.json") as f:
+with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v3/evaluation/MJHQ30K/meta_data.json") as f:
     meta_data = json.load(f)
 
-save_root_dir = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/output/"
+save_root_dir = "/nfs/home/tensore/RL/FastRLVAR/Infinity_v3/evaluation/MJHQ30K/output/"
 os.makedirs(save_root_dir,exist_ok=True)
 
 num_sampe = 0
@@ -93,8 +93,8 @@ for img_id,data in tqdm(meta_data.items()):
             g_seed=seed,
             gt_leak=0,
             gt_ls_Bl=None,
-            cfg_list=cfg,
-            tau_list=tau,
+            cfg_list=[cfg] * len(scale_schedule),
+            tau_list=[tau] * len(scale_schedule),
             scale_schedule=scale_schedule,
             cfg_insertion_layer=[args.cfg_insertion_layer],
             vae_type=args.vae_type,
@@ -106,7 +106,7 @@ for img_id,data in tqdm(meta_data.items()):
 
 
 # test fid
-ref_dir = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/mjhq30k_imgs/people"
+ref_dir = "/nfs/home/tensore/RL/FastRLVAR/Infinity_v3/evaluation/MJHQ30K/mjhq30k_imgs/people"
 gen_dir = save_root_dir
 fid_score = fid.compute_fid(ref_dir,gen_dir)
 print(f'FID score:{fid_score}')
@@ -169,7 +169,6 @@ if count > 0:
     print(f"Average CLIP Score: {average_clip_score}")
 else:
     print("No images were processed.")
-
 
 
 

@@ -10,9 +10,9 @@ import gc
 import argparse
 from infinity.utils.plot_pruned_tokens import set_pruned_output_dir, reset_pruned_data, finalize_pruned_tokens, plot_pruned_tokens
 
-model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_2b_reg.pth'
-vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_vae_d32reg.pth'
-text_encoder_ckpt = 'google/flan-t5-xl'
+model_path = '/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
+vae_path   = '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
+text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-xl/snapshots/7d6315df2c2fb742f0f5b556879d730926ca9001'
 
 # Benchmark settings
 batch_size = 1

@@ -223,7 +223,7 @@ if __name__ == "__main__":
     device = "cuda"
     dtype = torch.float16
     
-    # ==========================================
+    # ==========================================R
     # STEP 1: VERIFICATION (Small Tensors)
     # ==========================================
     print(f"--- 1. Verifying Correctness ---")

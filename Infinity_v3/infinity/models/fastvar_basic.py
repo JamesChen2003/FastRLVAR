@@ -297,7 +297,17 @@ class FastVARSelfAttention(nn.Module):
             else:
                 q_heads, k_heads, v_heads = q, k, v
                 if flash_attn_func is not None:
-                    oup = flash_attn_func(q_heads.to(v_heads.dtype), k_heads.to(v_heads.dtype), v_heads, dropout_p=0, softmax_scale=self.scale).reshape(B, L, C)
+                    # flash_attn_func expects (B, L, H, D); q/k/v here are (B, H, L, D)
+                    q_blhc = q_heads.transpose(1, 2)
+                    k_blhc = k_heads.transpose(1, 2)
+                    v_blhc = v_heads.transpose(1, 2)
+                    oup = flash_attn_func(
+                        q_blhc.to(v_blhc.dtype),
+                        k_blhc.to(v_blhc.dtype),
+                        v_blhc,
+                        dropout_p=0,
+                        softmax_scale=self.scale,
+                    ).reshape(B, L, C)
                 else:
                     attn_out, _, _ = flash_attention_entropy(q_heads, k_heads, v_heads, scale=self.scale, use_entropy=False)
                     oup = attn_out.transpose(1, 2).reshape(B, L, C)
@@ -643,4 +653,3 @@ class AdaLNBeforeHead(nn.Module):
             return self.ln_wo_grad(x_BLC).mul(scale.add(1)).add_(shift)
         else:
             return self.fused_norm_func(C=self.C, eps=self.norm_eps, x=x_BLC, scale=scale, shift=shift)
-
