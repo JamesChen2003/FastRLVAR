@@ -86,19 +86,30 @@ register(
 )
 
 my_config = {
-    "run_id": "entropy_PPO13",
+    "run_id": "hybrid_PPO_5",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
     "save_path": "models/sample_model/PPO",
     "num_train_envs": 1,
     "epoch_num": 50,
-    "eval_episode_num": 10,  # Evaluate over multiple prompts for more stable metrics
-    "prompt_pool_size": 256,
+    # "eval_episode_num": 30,  # Evaluate over multiple prompts for more stable metrics
+    "training_prompt_pool_size": 1000,
+    "eval_prompt_pool_size": 30,
+    "num_training_classes": 10,
+    # Shuffle training prompt order (reproducible)
+    "prompt_shuffle_seed": 0,
     "iterations_per_prompt": 1,
+    # VAREnv optimization: we pre-run the first N scales inside reset() and only
+    # learn pruning decisions on later scales.
+    "skip_first_N_scales": 9,
+
+    "base_steps_per_episode": 4,
+    "ppo_batch_size_base": 32,          
+    "sac_learning_starts_base": 40,     
 }
 
-my_config["rollout_steps"] = 13 * 16
-my_config["timesteps_per_epoch"] = my_config["prompt_pool_size"] * 13 * my_config["iterations_per_prompt"]
+# NOTE: rollout_steps and timesteps_per_epoch depend on the number of scales,
+# which is only known after scale_schedule is constructed. We set these later.
 
 class WandbEpisodeLogger(BaseCallback):
     """Callback to log custom episode metrics to wandb"""
@@ -124,8 +135,7 @@ class WandbEpisodeLogger(BaseCallback):
                         'custom/speed_score': episode_info.get('speed_score', 0),
                         'custom/total_reward': episode_info.get('total_reward', 0),
                         'custom/psnr': episode_info.get('psnr', 0),
-                        'custom/ms_ssim': episode_info.get('ms_ssim', 0),
-                        'custom/lpips': episode_info.get('lpips', 0),
+                        'custom/dreamsim': episode_info.get('dreamsim', 0),
                         'custom/prune_ratio': episode_info.get('prune_ratio', 0),
                     },
                     step=self.num_timesteps,
@@ -141,7 +151,9 @@ def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt
         scale_schedule, 
         text_tokenizer, 
         text_encoder, 
-        prompt)
+        prompt,
+        skip_first_N_scales=my_config["skip_first_N_scales"],
+    )
     env = Monitor(
         env,
         info_keywords=(
@@ -151,14 +163,13 @@ def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt
             "speed_score",
             "total_reward",
             "psnr",
-            "ms_ssim",
-            "lpips",
+            "dreamsim",
             "prune_ratio",
         ),
     )
     return env
 
-def eval(env, model, eval_episode_num):
+def eval(env, model, eval_prompt_pool_size):
     """
     Evaluate the model on the vectorized FastVAR environment.
     Always evaluates on the first N prompts to ensure fair comparison across epochs.
@@ -173,39 +184,47 @@ def eval(env, model, eval_episode_num):
     base_env.prompt_idx = -1  # Reset to start from prompt 0
     base_env._first_reset = True  # Reset the first_reset flag
     
+    # NOTE: SB3 VecEnvs (including DummyVecEnv) auto-reset environments when done=True.
+    # If we also call env.reset() per episode, we will skip every other prompt.
     avg_return = 0.0
     avg_quality = 0.0
     avg_speed = 0.0
 
-    for _ in range(eval_episode_num):
-        obs = env.reset()
-        done = False
-        ep_return = 0.0
-        ep_quality = 0.0
-        ep_speed = 0.0
-        steps = 0
+    obs = env.reset()
+    episodes_done = 0
 
-        while not done:
-            action, _state = model.predict(obs, deterministic=True)
-            obs, rewards, dones, infos = env.step(action)
-            r = float(rewards[0])
-            info = infos[0]
+    ep_return = 0.0
+    ep_quality = 0.0
+    ep_speed = 0.0
+    steps = 0
 
-            ep_return += r
-            ep_quality += info.get("quality_score", 0.0)
-            ep_speed += info.get("speed_score", 0.0)
-            steps += 1
+    while episodes_done < eval_prompt_pool_size:
+        action, _state = model.predict(obs, deterministic=True)
+        obs, rewards, dones, infos = env.step(action)
+        r = float(rewards[0])
+        info = infos[0]
 
-            done = bool(dones[0])
+        ep_return += r
+        ep_quality += info.get("quality_score", 0.0)
+        ep_speed += info.get("speed_score", 0.0)
+        steps += 1
 
-        avg_return += ep_return
-        if steps > 0:
-            avg_quality += ep_quality / steps
-            avg_speed += ep_speed / steps
+        if bool(dones[0]):
+            episodes_done += 1
+            avg_return += ep_return
+            if steps > 0:
+                avg_quality += ep_quality / steps
+                avg_speed += ep_speed / steps
 
-    avg_return /= eval_episode_num
-    avg_quality /= eval_episode_num
-    avg_speed /= eval_episode_num
+            # Reset per-episode accumulators.
+            ep_return = 0.0
+            ep_quality = 0.0
+            ep_speed = 0.0
+            steps = 0
+
+    avg_return /= eval_prompt_pool_size
+    avg_quality /= eval_prompt_pool_size
+    avg_speed /= eval_prompt_pool_size
 
     return avg_return, avg_quality, avg_speed
 
@@ -250,7 +269,7 @@ def train(eval_env, model, config):
         total_duration = time.time() - start_time
 
         eval_start = time.time()
-        avg_return, avg_quality, avg_speed = eval(eval_env, model, config["eval_episode_num"])
+        avg_return, avg_quality, avg_speed = eval(eval_env, model, config["eval_prompt_pool_size"])
         eval_duration = time.time() - eval_start
 
         print(f"\n{'='*60}")
@@ -260,7 +279,7 @@ def train(eval_env, model, config):
         print(f"   - Epoch time: {epoch_duration:.1f}s")
         print(f"   - Eval time: {eval_duration:.1f}s")
         print(f"   - Total time: {total_duration/60:.1f} min")
-        print(f"Performance (averaged over {config['eval_episode_num']} prompts):")
+        print(f"Performance (averaged over {config['eval_prompt_pool_size']} prompts):")
         print(f"   - Avg Return: {avg_return:.3f}")
         print(f"   - Avg Quality Score: {avg_quality:.3f}")
         print(f"   - Avg Speed Score: {avg_speed:.3f}")
@@ -344,22 +363,91 @@ if __name__ == "__main__":
         resume="allow",
     )
 
-    model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_2b_reg.pth'
-    vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/checkpoint/infinity_vae_d32reg.pth'
+    model_path = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_2b_reg.pth'
+    vae_path   = '/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/checkpoint/infinity_vae_d32reg.pth'
     text_encoder_ckpt = 'google/flan-t5-xl'
 
     # ------------ multi-prompt definition (name -> text) -------------
-    with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v2/evaluation/MJHQ30K/meta_data.json") as f:
+    with open("/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/evaluation/MJHQ30K/meta_data.json") as f:
         meta_data = json.load(f)
 
-    prompts = {}
+    category_list = ['animals', 'art', 'fashion', 'food', 'indoor', 'landscape', 'logo', 'people', 'plants', 'vehicles']
 
+    # ----------------- build disjoint, class-balanced train/eval prompt pools -----------------
+    num_classes = int(my_config["num_training_classes"])
+    if num_classes != len(category_list):
+        raise ValueError(
+            f"num_training_classes={num_classes} must match len(category_list)={len(category_list)} "
+            "for uniform sampling across all classes."
+        )
+
+    train_pool_size = int(my_config["training_prompt_pool_size"])
+    eval_pool_size = int(my_config["eval_prompt_pool_size"])
+    if train_pool_size < num_classes:
+        raise ValueError(
+            f"training_prompt_pool_size={train_pool_size} must be >= num_training_classes={num_classes} "
+            "to sample from all classes."
+        )
+    if eval_pool_size < num_classes:
+        raise ValueError(
+            f"eval_prompt_pool_size={eval_pool_size} must be >= num_training_classes={num_classes} "
+            "to sample from all classes."
+        )
+
+    def _nearly_uniform_counts(total: int, classes: int) -> List[int]:
+        """
+        Allocate `total` items across `classes` buckets with counts differing by at most 1.
+        Deterministic: extra items go to earlier buckets.
+        """
+        base = total // classes
+        rem = total % classes
+        return [base + (1 if i < rem else 0) for i in range(classes)]
+
+    per_class_train_list = _nearly_uniform_counts(train_pool_size, num_classes)
+    per_class_eval_list = _nearly_uniform_counts(eval_pool_size, num_classes)
+
+    prompts_by_cat = {c: [] for c in category_list}
     for img_id, data in meta_data.items():
-        if 'people' in data['category']:
-        # if 'fashion' in data['category']:
-            prompts[img_id] = data['prompt']
-        if len(prompts) >= my_config["prompt_pool_size"]:
-            break
+        cats = data.get("category", [])
+        # meta_data may store category as a string or a list; normalize to list[str].
+        if isinstance(cats, str):
+            cats_list = [cats]
+        else:
+            cats_list = list(cats)
+
+        for c in category_list:
+            if c in cats_list:
+                prompt = data.get("prompt", None)
+                if prompt:
+                    prompts_by_cat[c].append(prompt)
+
+    # Shuffle per-category prompt order to avoid bias from JSON iteration order.
+    rng = random.Random(int(my_config.get("prompt_shuffle_seed", 0)))
+    for c in category_list:
+        rng.shuffle(prompts_by_cat[c])
+
+    # Ensure we have enough prompts per class to make train/eval disjoint.
+    for i, c in enumerate(category_list):
+        need = per_class_train_list[i] + per_class_eval_list[i]
+        have = len(prompts_by_cat[c])
+        if have < need:
+            raise ValueError(
+                f"Not enough prompts for category '{c}': need {need} "
+                f"(train {per_class_train_list[i]} + eval {per_class_eval_list[i]}), have {have}."
+            )
+
+    # Deterministic selection: per class, take first K for train, next M for eval.
+    train_prompt_list = []
+    eval_prompt_list = []
+    for i, c in enumerate(category_list):
+        k_train = per_class_train_list[i]
+        k_eval = per_class_eval_list[i]
+        train_prompt_list.extend(prompts_by_cat[c][:k_train])
+        eval_prompt_list.extend(prompts_by_cat[c][k_train:k_train + k_eval])
+
+    # Shuffle training prompt order so VAREnv's round-robin prompt cycling
+    # sees a randomized class-mixed sequence.
+    rng.shuffle(train_prompt_list)
 
     # prompts = {
     #     # "cat":       "A cute cat on the grass.",
@@ -373,12 +461,7 @@ if __name__ == "__main__":
     base_output_dir = "results"
     os.makedirs(base_output_dir, exist_ok=True)
 
-    # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
-    # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-    # pruning_scales = "8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-    # pruning_scales = "20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
-    # pruning_scales = "48:1.0,64:1.0"
-    pruning_scales = "64:1.0"
+    pruning_scales = "64:0.0"
     parsed_prune_scales = parse_pruning_scales(pruning_scales)
 
     args = argparse.Namespace(
@@ -426,6 +509,48 @@ if __name__ == "__main__":
     scale_schedule = [(1, h, w) for (_, h, w) in scale_schedule]
     print(scale_schedule)
 
+    # ----------------- step accounting (must match VAREnv) -----------------
+    # VAREnv will run the first skip_first_N_scales internally during reset().
+    steps_per_episode = len(scale_schedule) - int(my_config["skip_first_N_scales"])
+    if steps_per_episode <= 0:
+        raise ValueError(
+            f"Invalid configuration: len(scale_schedule)={len(scale_schedule)} "
+            f"<= skip_first_N_scales={my_config['skip_first_N_scales']}."
+        )
+
+    # Keep the original heuristic: 16 episodes per PPO rollout, but with the
+    # new per-episode step count.
+    my_config["rollout_steps"] = steps_per_episode * 16
+
+    # ----------------- scale step-coupled hyperparams -----------------
+    base_steps = int(my_config.get("base_steps_per_episode", 13))
+    if base_steps <= 0:
+        raise ValueError(f"base_steps_per_episode must be > 0, got {base_steps}")
+    scale_factor = float(steps_per_episode) / float(base_steps)
+
+    # PPO batch size: scale and keep it divisible by steps_per_episode, and <= rollout_steps * n_envs.
+    ppo_batch_target = int(round(int(my_config.get("ppo_batch_size_base", 104)) * scale_factor))
+    ppo_batch_target = max(steps_per_episode, ppo_batch_target)
+    # snap down to a multiple of steps_per_episode
+    ppo_batch_target = (ppo_batch_target // steps_per_episode) * steps_per_episode
+    # hard constraint in SB3 PPO: batch_size <= n_steps * n_envs
+    max_ppo_batch = int(my_config["rollout_steps"]) * int(my_config["num_train_envs"])
+    if ppo_batch_target > max_ppo_batch:
+        ppo_batch_target = max(steps_per_episode, (max_ppo_batch // steps_per_episode) * steps_per_episode)
+    my_config["ppo_batch_size"] = int(max(1, ppo_batch_target))
+
+    # SAC learning_starts: scale and align to whole episodes (multiple of steps_per_episode).
+    sac_ls_target = int(round(int(my_config.get("sac_learning_starts_base", 130)) * scale_factor))
+    sac_ls_target = max(steps_per_episode, sac_ls_target)
+    sac_ls_target = (sac_ls_target // steps_per_episode) * steps_per_episode
+    my_config["sac_learning_starts"] = int(max(0, sac_ls_target))
+
+    # Train for prompt_pool_size episodes per epoch (times iterations_per_prompt),
+    # using the new per-episode step count.
+    my_config["timesteps_per_epoch"] = (
+        my_config["training_prompt_pool_size"] * steps_per_episode * my_config["iterations_per_prompt"]
+    )
+
     torch.cuda.synchronize()
     start_event = torch.cuda.Event(enable_timing=True)
     end_event = torch.cuda.Event(enable_timing=True)
@@ -434,11 +559,11 @@ if __name__ == "__main__":
     global_prompt_records = []
 
     # Create a single model that learns across all prompts
-    print(f"Creating environments for {len(prompts)} prompts...")
+    print(f"Creating environments for {len(train_prompt_list)} training prompts...")
     
     # Create training environments: each env receives the full prompt list and
     # VAREnv will rotate to a new prompt on each episode via reset().
-    prompt_list = list(prompts.values())
+    prompt_list = train_prompt_list
     
     def make_env_factory(prompts_for_env):
         """Factory function to create env with a prompt pool (fixes closure issue)."""
@@ -451,9 +576,8 @@ if __name__ == "__main__":
         for _ in range(my_config["num_train_envs"])
     ])
     
-    # For eval, use a fixed subset of prompts so metrics stay comparable across epochs.
-    # We still run `eval_episode_num` episodes, which will round-robin over this fixed list.
-    eval_prompt_list = prompt_list[: my_config["eval_episode_num"]]
+    # For eval, use a fixed prompt pool that is DISJOINT from training.
+    # We still run `eval_prompt_pool_size` episodes, which will round-robin over this fixed list.
     eval_env = DummyVecEnv([
         make_env_factory(eval_prompt_list)
     ])
@@ -465,15 +589,6 @@ if __name__ == "__main__":
         features_extractor_kwargs=dict(features_dim=256, width=64),
         normalize_images=False,
     )
-    # model = my_config["algorithm"](
-    #     my_config["policy_network"], 
-    #     train_env,
-    #     verbose=0,
-    #     tensorboard_log=my_config["run_id"],
-    #     policy_kwargs=policy_kwargs,
-    #     device = device,
-    #     n_steps=my_config["timesteps_per_epoch"]
-    # )
 
     if my_config["algorithm"] == PPO:
         model = my_config["algorithm"](
@@ -485,11 +600,11 @@ if __name__ == "__main__":
             device=device,
             # PPO-specific hyperparams
             n_steps=my_config["rollout_steps"],  
-            batch_size=104,                      
+            batch_size=my_config["ppo_batch_size"],
             n_epochs=4,                          
             learning_rate=1e-4,                  
             ent_coef=0.001,
-            gamma=0.995,                          
+            gamma=0.99,                          
         )
     elif my_config["algorithm"] == SAC:
         model = my_config["algorithm"](
@@ -505,10 +620,10 @@ if __name__ == "__main__":
             gradient_steps=4,     
             learning_rate=3e-4,
             buffer_size=20000,      # small, safe
-            learning_starts=130,
+            learning_starts=my_config["sac_learning_starts"],
             tau=0.005,
             gamma=0.99,
         )
 
-    print(f"Starting training on {len(prompts)} prompts...")
+    print(f"Starting training on {len(train_prompt_list)} prompts...")
     train(eval_env, model, my_config)

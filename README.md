@@ -1,4 +1,4 @@
-# FastRLVAR
+# ATP-VAR
 
 This README focuses on installation and the three main workflows: training, inference, and evaluation.
 
