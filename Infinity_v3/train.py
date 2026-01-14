@@ -86,15 +86,15 @@ register(
 )
 
 my_config = {
-    "run_id": "hybrid_PPO_5",
+    "run_id": "hybrid_PPO_10",
     "algorithm": PPO,
     "policy_network": "CnnPolicy",
-    "save_path": "models/sample_model/PPO",
+    "save_path": "models/sample_model/PPO_10",
     "num_train_envs": 1,
     "epoch_num": 50,
     # "eval_episode_num": 30,  # Evaluate over multiple prompts for more stable metrics
     "training_prompt_pool_size": 1000,
-    "eval_prompt_pool_size": 30,
+    "eval_prompt_pool_size": 50,
     "num_training_classes": 10,
     # Shuffle training prompt order (reproducible)
     "prompt_shuffle_seed": 0,
@@ -106,6 +106,12 @@ my_config = {
     "base_steps_per_episode": 4,
     "ppo_batch_size_base": 32,          
     "sac_learning_starts_base": 40,     
+
+    # PPO exploration / stability knobs (current iteration)
+    "rollout_steps_fixed": 512,
+    "ent_coef": 0.01,
+    "load_agent_from_checkpoint": False,
+    "load_agent_from_checkpoint_path": "models/sample_model/PPO_8/best_reward",
 }
 
 # NOTE: rollout_steps and timesteps_per_epoch depend on the number of scales,
@@ -518,9 +524,12 @@ if __name__ == "__main__":
             f"<= skip_first_N_scales={my_config['skip_first_N_scales']}."
         )
 
-    # Keep the original heuristic: 16 episodes per PPO rollout, but with the
-    # new per-episode step count.
-    my_config["rollout_steps"] = steps_per_episode * 16
+    # PPO rollout size (hardcoded for stability across a diverse prompt pool).
+    my_config["rollout_steps"] = int(my_config.get("rollout_steps_fixed", 512))
+    if my_config["rollout_steps"] <= 0:
+        raise ValueError(f"rollout_steps must be > 0, got {my_config['rollout_steps']}")
+
+    # NOTE: gSDE disabled (we observed action saturation near bounds after clipping).
 
     # ----------------- scale step-coupled hyperparams -----------------
     base_steps = int(my_config.get("base_steps_per_episode", 13))
@@ -591,21 +600,38 @@ if __name__ == "__main__":
     )
 
     if my_config["algorithm"] == PPO:
-        model = my_config["algorithm"](
-            my_config["policy_network"],
-            train_env,
-            verbose=0,
-            tensorboard_log=my_config["run_id"],
-            policy_kwargs=policy_kwargs,
-            device=device,
-            # PPO-specific hyperparams
-            n_steps=my_config["rollout_steps"],  
-            batch_size=my_config["ppo_batch_size"],
-            n_epochs=4,                          
-            learning_rate=1e-4,                  
-            ent_coef=0.001,
-            gamma=0.99,                          
-        )
+        if my_config.get("load_agent_from_checkpoint", False):
+            ckpt_path = my_config.get("load_agent_from_checkpoint_path", "")
+            if not ckpt_path:
+                raise ValueError("load_agent_from_checkpoint_path is empty")
+            if not os.path.exists(ckpt_path + ".zip") and not os.path.exists(ckpt_path):
+                raise FileNotFoundError(f"Checkpoint not found: {ckpt_path} (or {ckpt_path}.zip)")
+
+            print(f"Loading PPO agent from checkpoint: {ckpt_path}")
+            model = PPO.load(ckpt_path, env=train_env, device=device, print_system_info=False)
+
+            # Override key rollout/exploration knobs to match current config.
+            model.n_steps = int(my_config["rollout_steps"])
+            model.batch_size = int(my_config["ppo_batch_size"])
+            model.ent_coef = float(my_config.get("ent_coef", 0.01))
+            model.gamma = float(0.99)
+            model.tensorboard_log = my_config["run_id"]
+        else:
+            model = my_config["algorithm"](
+                my_config["policy_network"],
+                train_env,
+                verbose=0,
+                tensorboard_log=my_config["run_id"],
+                policy_kwargs=policy_kwargs,
+                device=device,
+                # PPO-specific hyperparams
+                n_steps=my_config["rollout_steps"],  
+                batch_size=my_config["ppo_batch_size"],
+                n_epochs=4,                          
+                learning_rate=1e-4,                  
+                ent_coef=float(my_config.get("ent_coef", 0.01)),
+                gamma=0.99,
+            )
     elif my_config["algorithm"] == SAC:
         model = my_config["algorithm"](
             my_config["policy_network"],

@@ -56,8 +56,8 @@ def encode_prompt(text_tokenizer, text_encoder, prompt, enable_positive_prompt=F
 
 class VAREnv(gym.Env):
     def __init__(self, infinity_test, vae, scale_schedule, text_tokenizer, text_encoder, prompt, 
-                 alpha: float = 0.6, beta: float = 1.0/0.2371, 
-                 golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/golden_images",
+                 alpha: float = 0.7, beta: float = 1.0/(0.0958 + 0.1523 + 0.1110 + 0.2161), reward_scale: float = 1.0/4.0, 
+                 golden_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/golden_images_4090",
                  # Inference configuration
                  B: int = 1,
                  negative_label_B_or_BLT=None,
@@ -79,7 +79,7 @@ class VAREnv(gym.Env):
                  inference_mode: bool = True,
                  sampling_per_bits: int = 1,
                  save_intermediate_results: bool = False,
-                 save_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/training_tmp_results",
+                 save_dir: str = "/home/remote/LDAP/r14_jameschen-1000043/FastVAR/Infinity_v3/training_tmp_results2",
                  ): # r14_jameschen-1000043/FastVAR/Infinity/golden_images #d10_rick_huang-1000011/RL/RL_final_project/FastRLVAR/golden_images
         self.infinity_test = infinity_test
         self.vae = vae
@@ -138,6 +138,9 @@ class VAREnv(gym.Env):
         self.label_B_or_BLT = None
         self._golden_imgs = {}
         self._golden_codes = {}
+
+        self.accumulated_speed_score = 0.0
+        self.reward_scale = reward_scale
 
         # TODO: Initialization (ensure golden images are precomputed)
 
@@ -353,7 +356,7 @@ class VAREnv(gym.Env):
             psnr_val = self._psnr(pruned_img_resized, golden_img)
             pruned_pil = self._to_pil_rgb(pruned_img_resized)
             golden_pil = self._to_pil_rgb(golden_img)
-            dreamsim_val = float(get_dreamsim_similarity(pruned_pil, golden_pil))
+            dreamsim_val = float(get_dreamsim_similarity(pruned_pil, golden_pil, dreamsim_type="ensemble"))
             dreamsim_val = float(max(min(dreamsim_val, 1.0), 0.0))
             return {
                 "psnr": psnr_val,
@@ -362,7 +365,7 @@ class VAREnv(gym.Env):
             }
 
     # def quality_func(self, x, a=0.68, b=0.92):
-    def quality_func(self, x, a=0.94, b=0.985, mode="cosine"):
+    def quality_func(self, x, a=0.94, b=0.985, mode="linear"):
         """
         mode: "linear" or "cosine"
         """
@@ -390,10 +393,15 @@ class VAREnv(gym.Env):
         prune_ratio = (float(action[0]) + 1) * 0.5
         prune_ratio = max(0.0, min(1.0, prune_ratio))
         
-        # linear speedup approximation
-        slope_scale =     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0424, 0.0801, 0.0847, 0.1561]
-        intercept_scale = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0165, -0.0024, -0.0287, -0.0333]
-        skip_scale =      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.1043, 0.1646, 0.1250, 0.2371]
+        # linear speedup approximation (3090)
+        # slope_scale =     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0424, 0.0801, 0.0847, 0.1561]
+        # intercept_scale = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0165, -0.0024, -0.0287, -0.0333]
+        # skip_scale =      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.1043, 0.1646, 0.1250, 0.2371]
+        
+        # linear speedup approximation (5090)
+        slope_scale =     [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0333, 0.0981, 0.0404, 0.1330]
+        intercept_scale = [0, 0, 0, 0, 0, 0, 0, 0, 0, -0.0097, -0.0242, -0.0186, -0.0229]
+        skip_scale =      [0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0958, 0.1523, 0.1110, 0.2161]
 
         if prune_ratio <= 0.0: # no pruning overhead for current scale
             speed_score = 0.0
@@ -496,17 +504,24 @@ class VAREnv(gym.Env):
                 golden_img_uint8 = (golden_img * 255.0).clamp(0, 255).byte().numpy()
                 golden_img_bgr = cv2.cvtColor(golden_img_uint8, cv2.COLOR_RGB2BGR)
                 cv2.imwrite(os.path.join(self.save_dir, f"golden_img_{current_scale}.png"), golden_img_bgr)
-                print(
-                    f"quality_score (similarity): {quality_score:.2f}, "
-                    f"PSNR: {psnr_val:.2f}, DreamSim: {dreamsim_val:.4f}"
-                )
 
-        quality_reward = self.quality_func(quality_score)
-        speed_reward = self.beta * speed_score
-        # increase alpha for stronger speed reward
-        # increase beta for weaker speed reward
-        reward = quality_reward * ( (1-self.alpha) + self.alpha * speed_reward) + (self.alpha * quality_reward if current_scale == len(self.scale_schedule) - 1 else 0.0)
 
+        # Accumulate speed score at every step (including the last scale) so the
+        # final reward reflects the full episode's pruning decisions.
+        self.accumulated_speed_score += speed_score
+
+
+        if current_scale == len(self.scale_schedule) - 1:
+            quality_reward = self.quality_func(quality_score)
+            speed_reward = self.beta * self.accumulated_speed_score
+            reward = quality_reward * (self.alpha * speed_reward + (1-self.alpha))
+        else:
+            quality_reward = self.quality_func(quality_score)
+            speed_reward = self.beta * speed_score
+            reward = quality_reward * (self.alpha * speed_reward + (1-self.alpha)) * self.reward_scale
+
+        
+        
         # Build observation: resize summed_codes with same interpolation mode as Infinity,
         # then append a scale-index channel. Everything is moved to CPU before
         # converting to NumPy for SB3.
@@ -557,13 +572,17 @@ class VAREnv(gym.Env):
             "psnr": psnr_val,
             "dreamsim": dreamsim_val,
             "alpha": self.alpha,
-            "reward_components": {
-                "alpha_quality": quality_reward,
-                "beta_speed": speed_reward,
-            },
         }
         self.pre_obs = obs
-        print(f"quality_reward: {quality_reward:.2f}, speed_reward: {speed_reward:.2f}, reward: {reward:.2f}")
+        
+        print("| Scale | prune | q_score |  PSNR | DreamSim |  speed | acc_speed | q_rew | s_rew | reward |")
+        print("|-----:|------:|--------:|------:|--------:|------:|---------:|-----:|-----:|------:|")
+
+        print(
+            f"| {current_scale:02d} | {prune_ratio*100:>4.0f}% | {quality_score:>6.2f} | {psnr_val:>5.2f} | "
+            f"{dreamsim_val:>7.4f} | {speed_score:>6.3f} | {self.accumulated_speed_score:>9.3f} | "
+            f"{quality_reward:>4.2f} | {speed_reward:>4.2f} | {reward:>6.2f} |"
+        )
         # Return observation, reward, done, truncate and info dict
         return obs, reward, done, False, info
 
@@ -682,6 +701,7 @@ class VAREnv(gym.Env):
         full_obs = torch.cat([prev_codes_resized, last_codes_resized, scale_plane], dim=0)
         obs = full_obs.numpy().astype(np.float32)
         self.pre_obs = obs
+        self.accumulated_speed_score = 0.0
         
         return obs, {}
     
