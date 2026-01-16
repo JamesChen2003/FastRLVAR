@@ -101,7 +101,7 @@ with torch.inference_mode():
             if hasattr(blk, "prune_scale_list"):
                 blk.prune_scale_list = conf_dict
 
-        for i in range(4):  # 4 images per config
+        for i in range(16):  # 16 images per config
             torch.cuda.empty_cache()
             gc.collect()
             torch.cuda.synchronize()
@@ -138,10 +138,11 @@ with torch.inference_mode():
             latencies.append(latency)
             print(f"  Run {i+1}: {latency:.2f} ms")
             
-        # Average later 3
-        avg_latency = sum(latencies[1:]) / 3
+        # Trim 3 fastest + 3 slowest, average the middle 10
+        trimmed = sorted(latencies)[3:-3]
+        avg_latency = sum(trimmed) / len(trimmed)
         benchmark_results[conf_str] = avg_latency
-        print(f"  Average (last 3): {avg_latency:.2f} ms")
+        print(f"  Average (trimmed 3 fast/slow): {avg_latency:.2f} ms")
 
 # Save to JSON
 output_json = os.path.join(base_output_dir, "latency_benchmark.json")

@@ -44,7 +44,7 @@ def main() -> None:
         "path",
         nargs="?",
         type=Path,
-        default=Path(__file__).resolve().parent / "Infinity_v2",
+        default=Path(__file__).resolve().parent / "Infinity_v3",
         help="Directory containing consume*.txt files, or a single consume*.txt file.",
     )
     args = parser.parse_args()

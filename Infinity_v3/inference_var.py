@@ -129,40 +129,55 @@ def make_env(infinity, vae, scale_schedule, text_tokenizer, text_encoder, prompt
 def eval(env, model, eval_episode_num):
     """
     Evaluate the model on the vectorized FastVAR environment.
+    Always evaluates on the first N prompts to ensure fair comparison.
     Returns:
         avg_return: average episode return
         avg_quality: average per-step quality_score
         avg_speed: average per-step speed_score
     """
+    # Reset prompt index to ensure we always evaluate on the same set/order of prompts.
+    # NOTE: env.envs[0] is a Monitor wrapper; use .unwrapped to reach VAREnv.
+    base_env = env.envs[0].unwrapped
+    base_env.prompt_idx = -1  # Reset to start from prompt 0
+    base_env._first_reset = True  # Reset the first_reset flag
+
+    # NOTE: SB3 VecEnvs (including DummyVecEnv) auto-reset environments when done=True.
+    # If we also call env.reset() per episode, we will skip every other prompt.
     avg_return = 0.0
     avg_quality = 0.0
     avg_speed = 0.0
 
-    for _ in range(eval_episode_num):
-        obs = env.reset()
-        done = False
-        ep_return = 0.0
-        ep_quality = 0.0
-        ep_speed = 0.0
-        steps = 0
+    obs = env.reset()
+    episodes_done = 0
 
-        while not done:
-            action, _state = model.predict(obs, deterministic=True)
-            obs, rewards, dones, infos = env.step(action)
-            r = float(rewards[0])
-            info = infos[0]
+    ep_return = 0.0
+    ep_quality = 0.0
+    ep_speed = 0.0
+    steps = 0
 
-            ep_return += r
-            ep_quality += info.get("quality_score", 0.0)
-            ep_speed += info.get("speed_score", 0.0)
-            steps += 1
+    while episodes_done < eval_episode_num:
+        action, _state = model.predict(obs, deterministic=True)
+        obs, rewards, dones, infos = env.step(action)
+        r = float(rewards[0])
+        info = infos[0]
 
-            done = bool(dones[0])
+        ep_return += r
+        ep_quality += info.get("quality_score", 0.0)
+        ep_speed += info.get("speed_score", 0.0)
+        steps += 1
 
-        avg_return += ep_return
-        if steps > 0:
-            avg_quality += ep_quality / steps
-            avg_speed += ep_speed / steps
+        if bool(dones[0]):
+            episodes_done += 1
+            avg_return += ep_return
+            if steps > 0:
+                avg_quality += ep_quality / steps
+                avg_speed += ep_speed / steps
+
+            # Reset per-episode accumulators.
+            ep_return = 0.0
+            ep_quality = 0.0
+            ep_speed = 0.0
+            steps = 0
 
     avg_return /= eval_episode_num
     avg_quality /= eval_episode_num
@@ -292,20 +307,7 @@ def save_prune_ratios(run_dir: str, prune_ratios: dict):
         json.dump(prune_ratios, f, ensure_ascii=False, indent=4)
     print(f"Wrote prune ratios to {os.path.abspath(output_path)}")
 
-def parse_cli_args():
-    parser = argparse.ArgumentParser(description="Run VAR inference and save eval outputs.")
-    parser.add_argument(
-        "-3c",
-        "--three-class",
-        dest="three_class",
-        action="store_true",
-        help="Save outputs into landscape/food/people subfolders with their own JSON files.",
-    )
-    return parser.parse_args()
-
 if __name__ == "__main__":
-    cli_args = parse_cli_args()
-
     # Create wandb session
     # run = wandb.init(
     #     project="FastVAR_Infinity",
@@ -316,53 +318,34 @@ if __name__ == "__main__":
     #     resume="allow",
     # )
 
-    model_path='/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
-    vae_path=  '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
-    text_encoder_ckpt = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-x'
+    model_path = '/nfs/home/tensore/pretrained/Infinity/infinity_2b_reg.pth'
+    vae_path = '/nfs/home/tensore/pretrained/Infinity/infinity_vae_d32reg.pth'
+
+    def resolve_text_encoder_ckpt() -> str:
+        # Prefer local cached snapshot if available; otherwise fall back to HF repo id.
+        local_snapshots = '/nfs/home/tensore/pretrained/Infinity/models--google--flan-t5-xl/snapshots'
+        if os.path.isdir(local_snapshots):
+            candidates = sorted(os.listdir(local_snapshots))
+            if candidates:
+                return os.path.join(local_snapshots, candidates[-1])
+        return 'google/flan-t5-xl'
+
+    text_encoder_ckpt = resolve_text_encoder_ckpt()
 
     # ------------ multi-prompt definition (name -> text) -------------
     # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/report.json") as f:
 
-    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_3class.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data.json") as f:
         meta_data = json.load(f)
 
-    three_class_categories = ["landscape", "food", "people"]
-    three_class_enabled = cli_args.three_class
-    prompt_limit = int(my_config.get("prompt_pool_size", 0))
+    prompts = {}
 
-    if three_class_enabled:
-        prompts_by_category = {cat: [] for cat in three_class_categories}
-        for img_id, data in meta_data.items():
-            prompt = data.get("prompt")
-            if not prompt:
-                continue
-            cats = data.get("category", [])
-            if isinstance(cats, str):
-                cats_list = [cats]
-            else:
-                cats_list = list(cats)
-            cats_norm = [str(c).lower() for c in cats_list]
-            target_cat = None
-            for cat in three_class_categories:
-                if cat in cats_norm:
-                    target_cat = cat
-                    break
-            if target_cat is None:
-                continue
-            if prompt_limit and len(prompts_by_category[target_cat]) >= prompt_limit:
-                continue
-            prompts_by_category[target_cat].append((img_id, prompt))
-    else:
-        prompts = {}
-        for img_id, data in meta_data.items():
-            # if 'people' in data['category']:
-            # if 'fashion' in data['category']:
-            prompt = data.get("prompt")
-            if not prompt:
-                continue
-            prompts[img_id] = prompt
-            if prompt_limit and len(prompts) >= prompt_limit:
-                break
+    for img_id, data in meta_data.items():
+        # if 'people' in data['category']:
+        # if 'fashion' in data['category']:
+        prompts[img_id] = data['prompt']
+        if len(prompts) >= my_config["prompt_pool_size"]:
+            break
 
     # prompts = {
     #     # "cat":       "A cute cat on the grass.",
@@ -377,14 +360,6 @@ if __name__ == "__main__":
     os.makedirs(base_output_dir, exist_ok=True)
     run_output_dir = prepare_run_dir(base_output_dir)
     print(f"Saving outputs to {os.path.abspath(run_output_dir)}")
-    if three_class_enabled:
-        output_dirs = {}
-        for cat in three_class_categories:
-            cat_dir = os.path.join(run_output_dir, cat)
-            os.makedirs(cat_dir, exist_ok=True)
-            output_dirs[cat] = cat_dir
-    else:
-        output_dirs = None
 
     # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
     # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
@@ -437,7 +412,7 @@ if __name__ == "__main__":
         OBS_CHANNELS = 32 + 32 + 1  # prev codes + current codes + scale channel
         SKIP_FIRST_N_SCALES = 9
 
-        trained_model_path = './checkpoint/best_v2_PPO3'
+        trained_model_path = './checkpoint/best_v3_PPO10'
         print(f"Loading PPO Agent from {trained_model_path}...")
         # 強制使用自訂的 CNN feature extractor，避免預設 NatureCNN 對 Box(-inf, inf, (65, 64, 64)) 報錯
         policy_kwargs = dict(
@@ -479,16 +454,10 @@ if __name__ == "__main__":
 
     
     # Create a single model that learns across all prompts
-    if three_class_enabled:
-        total_prompts = sum(len(items) for items in prompts_by_category.values())
-        print(f"Creating environments for {total_prompts} prompts across 3 classes...")
-        prompt_items = []
-        for cat in three_class_categories:
-            prompt_items.extend([(img_id, prompt, cat) for img_id, prompt in prompts_by_category[cat]])
-    else:
-        print(f"Creating environments for {len(prompts)} prompts...")
-        # Keep both id and text for each prompt so we can save {Id}.jpg and metadata
-        prompt_items = list(prompts.items())
+    print(f"Creating environments for {len(prompts)} prompts...")
+    
+    # Keep both id and text for each prompt so we can save {Id}.jpg and metadata
+    prompt_items = list(prompts.items())
 
     cfg_list=[cfg_value] * len(scale_schedule)
     tau_list=[tau_value] * len(scale_schedule)
@@ -512,25 +481,10 @@ if __name__ == "__main__":
     save_dir=None
     per_scale_infer=True
 
-    if three_class_enabled:
-        used_metadata = {cat: {} for cat in three_class_categories}
-        prune_ratio_records = {cat: {} for cat in three_class_categories}
-    else:
-        used_metadata = {}
-        prune_ratio_records = {}
+    used_metadata = {}
+    prune_ratio_records = {}
 
-    for image_num, item in enumerate(prompt_items):
-        if three_class_enabled:
-            img_id, prompt, category = item
-            output_dir = output_dirs[category]
-            used_metadata_store = used_metadata[category]
-            prune_ratio_store = prune_ratio_records[category]
-        else:
-            img_id, prompt = item
-            category = None
-            output_dir = run_output_dir
-            used_metadata_store = used_metadata
-            prune_ratio_store = prune_ratio_records
+    for image_num, (img_id, prompt) in enumerate(prompt_items):
         start_time_total = time.time()
         consume_time = 0
 
@@ -573,7 +527,7 @@ if __name__ == "__main__":
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
                     wall_start = time.perf_counter()
-                    decode_img = si == num_scales - 1
+                    ret_img = save_intermediate_results or (si == num_scales - 1)
                     if load_model is not True:
                         prune_ratio = get_pruning_ratio(si, num_scales)
                     else:
@@ -649,10 +603,10 @@ if __name__ == "__main__":
                             gt_ls_Bl=gt_ls_Bl,
                             inference_mode=True,
                             sampling_per_bits=sampling_per_bits,
+                            ret_img=ret_img,
                             save_intermediate_results=save_intermediate_results,
                             save_dir=save_dir,
                             state=state,
-                            decode_img=decode_img,
                         )
                         if load_model:
                             pre_obs = obs
@@ -668,7 +622,7 @@ if __name__ == "__main__":
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.
                 reset_prune_print_cache()
-                prune_ratio_store[img_id] = per_image_prune_ratios[-4:]
+                prune_ratio_records[img_id] = per_image_prune_ratios[-4:]
 
                 # `img` is already the decoded uint8 image for the final scale.
                 img_list = [img]
@@ -718,24 +672,19 @@ if __name__ == "__main__":
         with open("total_consume_time.txt", "a") as file:
             file.write(f'{img_id}: {total_elapsed}\n')
 
-        img_path = os.path.join(output_dir, f"{img_id}.jpg")
+        img_path = os.path.join(run_output_dir, f"{img_id}.jpg")
         cv2.imwrite(img_path, img.cpu().numpy())
         print(f"Saved image for {img_id} to {os.path.abspath(img_path)} (total {total_elapsed:.2f}s, infer-only {consume_time:.2f}s)")
 
         # Collect metadata for this image id so we can write a meta_data.json
         # that mirrors the structure used by inference_for_eval.py
         if img_id in meta_data:
-            used_metadata_store[img_id] = meta_data[img_id]
+            used_metadata[img_id] = meta_data[img_id]
         else:
-            used_metadata_store[img_id] = {"prompt": prompt}
-        if img_id in prune_ratio_store:
-            used_metadata_store[img_id]["prune_ratio_last4"] = prune_ratio_store[img_id]
+            used_metadata[img_id] = {"prompt": prompt}
+        if img_id in prune_ratio_records:
+            used_metadata[img_id]["prune_ratio_last4"] = prune_ratio_records[img_id]
 
     # Save metadata for all generated images in this run
-    if three_class_enabled:
-        for cat in three_class_categories:
-            save_used_metadata(output_dirs[cat], used_metadata[cat])
-            save_prune_ratios(output_dirs[cat], prune_ratio_records[cat])
-    else:
-        save_used_metadata(run_output_dir, used_metadata)
-        save_prune_ratios(run_output_dir, prune_ratio_records)
+    save_used_metadata(run_output_dir, used_metadata)
+    save_prune_ratios(run_output_dir, prune_ratio_records)
