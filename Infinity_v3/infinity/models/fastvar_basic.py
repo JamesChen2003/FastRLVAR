@@ -568,7 +568,9 @@ class FastVARCrossAttnBlock(nn.Module):
                 anchor_entropy = FastVARCrossAttnBlock.anchor_entropy_current_scale
                 if anchor_entropy is not None:
                     # [UPDATE 1]: Reduced pruning ratio for Self-Attention
-                    self_attn_reduce_ratio = 0.75
+                    #TODO 測試不同的ratio
+                    # self_attn_reduce_ratio = 0.75
+                    self_attn_reduce_ratio = 0.25
                     original_ratio = self.prune_scale_list.get(original_w)
                     scaled_prune_list_sa = {k: v * self_attn_reduce_ratio for k, v in self.prune_scale_list.items()} if self.prune_scale_list else None
                     

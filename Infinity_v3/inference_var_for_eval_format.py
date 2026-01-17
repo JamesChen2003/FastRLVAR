@@ -126,7 +126,19 @@ def save_prune_ratios(run_dir: str, prune_ratios: dict):
         json.dump(prune_ratios, f, ensure_ascii=False, indent=4)
     print(f"Wrote prune ratios to {os.path.abspath(output_path)}")
 
+def parse_cli_args():
+    parser = argparse.ArgumentParser(description="Run VAR inference and save eval outputs.")
+    parser.add_argument(
+        "-3c",
+        "--three-class",
+        dest="three_class",
+        action="store_true",
+        help="Save outputs into landscape/food/people subfolders with their own timing files.",
+    )
+    return parser.parse_args()
+
 if __name__ == "__main__":
+    cli_args = parse_cli_args()
     # Create wandb session
     # run = wandb.init(
     #     project="FastVAR_Infinity",
@@ -161,13 +173,51 @@ if __name__ == "__main__":
 
     with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data.json") as f:
         meta_data = json.load(f)
-    prompts = {}
+    three_class_categories = ["landscape", "food", "people"]
+    three_class_enabled = cli_args.three_class
+    prompt_limit = int(prompt_pool_size or 0)
+    if three_class_enabled:
+        prompt_limit = 0
 
-    for img_id, data in meta_data.items():
-        if 'people' in data['category']:
-        # if 'fashion' in data['category']:
-            prompts[img_id] = data['prompt']
-            if len(prompts) >= prompt_pool_size:
+    if three_class_enabled:
+        prompts_by_category = {cat: [] for cat in three_class_categories}
+        for img_id, data in meta_data.items():
+            prompt = data.get("prompt")
+            if not prompt:
+                continue
+            cats = data.get("category", [])
+            if isinstance(cats, str):
+                cats_list = [cats]
+            else:
+                cats_list = list(cats) if cats is not None else []
+            cats_norm = [str(c).lower() for c in cats_list]
+            target_cat = None
+            for cat in three_class_categories:
+                if cat in cats_norm:
+                    target_cat = cat
+                    break
+            if target_cat is None:
+                continue
+            if prompt_limit and len(prompts_by_category[target_cat]) >= prompt_limit:
+                continue
+            prompts_by_category[target_cat].append((img_id, prompt))
+    else:
+        prompts = {}
+        for img_id, data in meta_data.items():
+            prompt = data.get("prompt")
+            if not prompt:
+                continue
+            cats = data.get("category", [])
+            if isinstance(cats, str):
+                cats_list = [cats]
+            else:
+                cats_list = list(cats) if cats is not None else []
+            cats_norm = [str(c).lower() for c in cats_list]
+            if "people" not in cats_norm:
+                continue
+            # if "fashion" in cats_norm:
+            prompts[img_id] = prompt
+            if prompt_limit and len(prompts) >= prompt_limit:
                 break
 
     # prompts = {
@@ -183,7 +233,16 @@ if __name__ == "__main__":
     os.makedirs(base_output_dir, exist_ok=True)
     run_output_dir = prepare_run_dir(base_output_dir)
     print(f"Saving outputs to {os.path.abspath(run_output_dir)}")
+    if three_class_enabled:
+        output_dirs = {}
+        for cat in three_class_categories:
+            cat_dir = os.path.join(run_output_dir, cat)
+            os.makedirs(cat_dir, exist_ok=True)
+            output_dirs[cat] = cat_dir
+    else:
+        output_dirs = None
     runtime_path = os.path.join(run_output_dir, "runtime.txt")
+    total_runtime_path = os.path.join(run_output_dir, "total_runtime.txt")
 
     # si: [1, 2, 4, 6, 8, 12, 16, 20, 24, 32, 40, 48, 64]
     # pruning_scales = "2:1.0,4:1.0,6:1.0,8:1.0,12:1.0,16:1.0,20:1.0,24:1.0,32:1.0,40:1.0,48:1.0,64:1.0"
@@ -258,6 +317,27 @@ if __name__ == "__main__":
         ctime_filename = f"ctime_{ppo_name}.txt"
     else:
         ctime_filename = "consume_time.txt"
+    root_ctime_path = ctime_filename
+    root_total_consume_path = "total_consume_time.txt"
+    run_ctime_path = os.path.join(run_output_dir, ctime_filename)
+    run_total_consume_path = os.path.join(run_output_dir, "total_consume_time.txt")
+    global_time_paths = {
+        "runtime": runtime_path,
+        "total_runtime": total_runtime_path,
+        "consume": run_ctime_path,
+        "total_consume": run_total_consume_path,
+    }
+    if three_class_enabled:
+        category_time_paths = {}
+        for cat, out_dir in output_dirs.items():
+            category_time_paths[cat] = {
+                "runtime": os.path.join(out_dir, "runtime.txt"),
+                "total_runtime": os.path.join(out_dir, "total_runtime.txt"),
+                "consume": os.path.join(out_dir, ctime_filename),
+                "total_consume": os.path.join(out_dir, "total_consume_time.txt"),
+            }
+    else:
+        category_time_paths = None
 
     cfg_value = 4
     tau_value = 0.5
@@ -278,10 +358,18 @@ if __name__ == "__main__":
 
     
     # Create a single model that learns across all prompts
-    print(f"Creating environments for {len(prompts)} prompts...")
-    
-    # Keep both id and text for each prompt so we can save {Id}.jpg and metadata
-    prompt_items = list(prompts.items())
+    if three_class_enabled:
+        total_prompts = sum(len(items) for items in prompts_by_category.values())
+        print(f"Creating environments for {total_prompts} prompts across 3 classes...")
+        prompt_items = []
+        for cat in three_class_categories:
+            prompt_items.extend(
+                [(img_id, prompt, cat) for img_id, prompt in prompts_by_category[cat]]
+            )
+    else:
+        print(f"Creating environments for {len(prompts)} prompts...")
+        # Keep both id and text for each prompt so we can save {Id}.jpg and metadata
+        prompt_items = list(prompts.items())
 
     cfg_list=[cfg_value] * len(scale_schedule)
     tau_list=[tau_value] * len(scale_schedule)
@@ -304,11 +392,37 @@ if __name__ == "__main__":
     save_dir=None
     per_scale_infer=True
 
-    used_metadata = {}
-    prune_ratio_records = {}
-    total_elapsed_list = []
+    if three_class_enabled:
+        used_metadata = {cat: {} for cat in three_class_categories}
+        prune_ratio_records = {cat: {} for cat in three_class_categories}
+        runtime_list = {cat: [] for cat in three_class_categories}
+        total_runtime_list = {cat: [] for cat in three_class_categories}
+    else:
+        used_metadata = {}
+        prune_ratio_records = {}
+        runtime_list = []
+        total_runtime_list = []
+    runtime_list_all = []
+    total_runtime_list_all = []
 
-    for image_num, (img_id, prompt) in enumerate(prompt_items):
+    for image_num, item in enumerate(prompt_items):
+        if three_class_enabled:
+            img_id, prompt, category = item
+            output_dir = output_dirs[category]
+            used_metadata_store = used_metadata[category]
+            prune_ratio_store = prune_ratio_records[category]
+            runtime_list_store = runtime_list[category]
+            total_runtime_list_store = total_runtime_list[category]
+            time_paths = category_time_paths[category]
+        else:
+            img_id, prompt = item
+            category = None
+            output_dir = run_output_dir
+            used_metadata_store = used_metadata
+            prune_ratio_store = prune_ratio_records
+            runtime_list_store = runtime_list
+            total_runtime_list_store = total_runtime_list
+            time_paths = global_time_paths
         start_time_total = time.time()
         consume_time = 0
 
@@ -518,7 +632,7 @@ if __name__ == "__main__":
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.
                 reset_prune_print_cache()
-                prune_ratio_records[img_id] = per_image_prune_ratios[-4:]
+                prune_ratio_store[img_id] = per_image_prune_ratios[-4:]
 
                 # Keep a consistent downstream interface with the autoregressive path.
                 img_list = [img]
@@ -574,7 +688,7 @@ if __name__ == "__main__":
                 # One full image (all scales) is done; reset print cache so pruning
                 # ratio logs are emitted again for the next image.
                 reset_prune_print_cache()
-                prune_ratio_records[img_id] = per_image_prune_ratios[-4:]
+                prune_ratio_store[img_id] = per_image_prune_ratios[-4:]
 
                 # `img` is already the decoded uint8 image for the final scale.
                 img_list = [img]
@@ -617,34 +731,73 @@ if __name__ == "__main__":
         if isinstance(img, torch.Tensor) and img.dim() == 4 and img.shape[0] == 1:
             img = img[0]
 
-        with open(ctime_filename, "a") as file:
-            file.write(f'{img_id}: {consume_time}\n')
+        with open(root_ctime_path, "a") as file:
+            file.write(f"{img_id}: {consume_time}\n")
+        with open(global_time_paths["consume"], "a") as file:
+            file.write(f"{img_id}: {consume_time}\n")
+        if three_class_enabled:
+            with open(time_paths["consume"], "a") as file:
+                file.write(f"{img_id}: {consume_time}\n")
 
         total_elapsed = time.time() - start_time_total
-        total_elapsed_list.append(total_elapsed)
-        with open(runtime_path, "a") as file:
+        runtime_list_all.append(consume_time)
+        total_runtime_list_all.append(total_elapsed)
+        runtime_list_store.append(consume_time)
+        total_runtime_list_store.append(total_elapsed)
+        with open(global_time_paths["runtime"], "a") as file:
+            file.write(f"{img_id}: {consume_time}\n")
+        with open(global_time_paths["total_runtime"], "a") as file:
             file.write(f"{img_id}: {total_elapsed}\n")
-        with open("total_consume_time.txt", "a") as file:
-            file.write(f'{img_id}: {total_elapsed}\n')
+        if three_class_enabled:
+            with open(time_paths["runtime"], "a") as file:
+                file.write(f"{img_id}: {consume_time}\n")
+            with open(time_paths["total_runtime"], "a") as file:
+                file.write(f"{img_id}: {total_elapsed}\n")
+        with open(root_total_consume_path, "a") as file:
+            file.write(f"{img_id}: {total_elapsed}\n")
+        with open(global_time_paths["total_consume"], "a") as file:
+            file.write(f"{img_id}: {total_elapsed}\n")
+        if three_class_enabled:
+            with open(time_paths["total_consume"], "a") as file:
+                file.write(f"{img_id}: {total_elapsed}\n")
 
-        img_path = os.path.join(run_output_dir, f"{img_id}.jpg")
+        img_path = os.path.join(output_dir, f"{img_id}.jpg")
         cv2.imwrite(img_path, img.cpu().numpy())
         print(f"Saved image for {img_id} to {os.path.abspath(img_path)} (total {total_elapsed:.2f}s, infer-only {consume_time:.2f}s)")
 
         # Collect metadata for this image id so we can write a meta_data.json
         # that mirrors the structure used by inference_for_eval.py
         if img_id in meta_data:
-            used_metadata[img_id] = meta_data[img_id]
+            used_metadata_store[img_id] = meta_data[img_id]
         else:
-            used_metadata[img_id] = {"prompt": prompt}
-        if img_id in prune_ratio_records:
-            used_metadata[img_id]["prune_ratio_last4"] = prune_ratio_records[img_id]
+            used_metadata_store[img_id] = {"prompt": prompt}
+        if img_id in prune_ratio_store:
+            used_metadata_store[img_id]["prune_ratio_last4"] = prune_ratio_store[img_id]
 
-    if total_elapsed_list:
-        avg_elapsed = sum(total_elapsed_list) / len(total_elapsed_list)
-        with open(runtime_path, "a") as file:
-            file.write(f"average: {avg_elapsed}\n")
+    if runtime_list_all:
+        avg_runtime = sum(runtime_list_all) / len(runtime_list_all)
+        with open(global_time_paths["runtime"], "a") as file:
+            file.write(f"average: {avg_runtime}\n")
+    if total_runtime_list_all:
+        avg_total = sum(total_runtime_list_all) / len(total_runtime_list_all)
+        with open(global_time_paths["total_runtime"], "a") as file:
+            file.write(f"average: {avg_total}\n")
+    if three_class_enabled:
+        for cat in three_class_categories:
+            if runtime_list[cat]:
+                avg_runtime = sum(runtime_list[cat]) / len(runtime_list[cat])
+                with open(category_time_paths[cat]["runtime"], "a") as file:
+                    file.write(f"average: {avg_runtime}\n")
+            if total_runtime_list[cat]:
+                avg_total = sum(total_runtime_list[cat]) / len(total_runtime_list[cat])
+                with open(category_time_paths[cat]["total_runtime"], "a") as file:
+                    file.write(f"average: {avg_total}\n")
 
     # Save metadata for all generated images in this run
-    save_used_metadata(run_output_dir, used_metadata)
-    save_prune_ratios(run_output_dir, prune_ratio_records)
+    if three_class_enabled:
+        for cat in three_class_categories:
+            save_used_metadata(output_dirs[cat], used_metadata[cat])
+            save_prune_ratios(output_dirs[cat], prune_ratio_records[cat])
+    else:
+        save_used_metadata(run_output_dir, used_metadata)
+        save_prune_ratios(run_output_dir, prune_ratio_records)

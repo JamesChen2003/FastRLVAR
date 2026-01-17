@@ -323,12 +323,15 @@ if __name__ == "__main__":
     # ------------ multi-prompt definition (name -> text) -------------
     # with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/report.json") as f:
 
-    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_3class.json") as f:
+    with open("/nfs/home/tensore/RL/FastRLVAR/Infinity_v2/meta_data_test.json") as f:
         meta_data = json.load(f)
 
     three_class_categories = ["landscape", "food", "people"]
     three_class_enabled = cli_args.three_class
     prompt_limit = int(my_config.get("prompt_pool_size", 0))
+    if three_class_enabled:
+        # Run all prompts when using -3c.
+        prompt_limit = 0
 
     if three_class_enabled:
         prompts_by_category = {cat: [] for cat in three_class_categories}
@@ -429,7 +432,8 @@ if __name__ == "__main__":
     infinity = load_transformer(vae, args)
 
     #### load PPO model
-    load_model = True
+    # load_model = True
+    load_model = False
     trained_model_path = None
     if load_model:
 

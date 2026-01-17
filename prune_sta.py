@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import json
 
 # 1. 載入數據
-data = {
+data ={
     "99b272ae23876c2a554b2b4a5a584bd7cb74d330": [
         0.0,
         0.35174626111984253,
@@ -6005,8 +6005,7 @@ data = {
         1.0,
         1.0
     ]
-}
-# 2. 轉換為長格式 (Long Format)
+}# 2. 轉換為長格式 (Long Format)
 rows = []
 scales = ['K-3', 'K-2', 'K-1', 'K']
 for sample_id, p_values in data.items():
